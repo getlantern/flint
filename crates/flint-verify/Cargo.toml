@@ -1,0 +1,10 @@
+[package]
+name = "flint-verify"
+description = "Ed25519 verification of signed bootstrap blobs (config / strategy updates)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

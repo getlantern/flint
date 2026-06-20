@@ -1,0 +1,10 @@
+[package]
+name = "flint-shaping"
+description = "Wire-shaping primitives: tcp_split (TCP-segment) and record_fragment (TLS-record)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

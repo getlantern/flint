@@ -1,0 +1,10 @@
+[package]
+name = "flint-dns"
+description = "Resilient DoH resolver (race, validate, cache) + a minimal A/AAAA DNS codec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "flint-tls"
+description = "Chrome-mimicry TLS: the boring Chrome-ClientHello connector, the gambit CH genome, JA4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The boring2 Chrome-mimicry engine. Off by default so the baseline build stays rustls/ring-only —
+# mirrors spark's `anytls` feature. Pulls boring2/tokio-boring2 when enabled (added at extraction step 3).
+boring = []
+
+[dependencies]

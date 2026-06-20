@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flint-verify",
+    "crates/flint-shaping",
+    "crates/flint-tls",
+    "crates/flint-dial",
+    "crates/flint-dns",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+# Mirrors spark's MSRV: tun-rs 2.8.x (edition 2024) and the vendored netstack pin it to >= 1.85.
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/getlantern/flint"
+
+# Shared deps for the foundation crates as they are populated (see docs/extraction-plan.md). Declared
+# here so members inherit a single pinned version with `.workspace = true`. Unused entries are inert
+# until a crate references them. Locked stack mirrors spark: rustls+ring baseline, boring gated.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+ring = "0.17"
+
+# Mirrors spark's release profile (binary-size discipline). Only governs flint's own builds; a
+# consuming binary (spark) sets its own profile. Affects `--release` only, so `cargo test` (dev) keeps
+# unwind for `#[should_panic]`.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false
