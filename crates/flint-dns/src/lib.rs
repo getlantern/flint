@@ -14,6 +14,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::time::Duration;
 
 pub mod cache;
 pub mod codec;
@@ -38,6 +39,17 @@ pub enum ResolveError {
     },
 }
 
+/// How many DoH dials race at once inside [`resolve`]. The pool may grow to hundreds of raw resolver
+/// IPs (design §3.1); the window caps in-flight attempts regardless of list length. Today's pool fits
+/// in one window, so it's effectively all-at-once.
+const DEFAULT_WINDOW: usize = 16;
+
+/// Per-resolver attempt deadline. `flint_dial::dial` doesn't bound its TCP connect, so a filtered
+/// resolver IP would blackhole the connect and (worse, under windowing) hold its window slot. Bounding
+/// each attempt frees the slot so the window refills, and makes the all-fail case return promptly
+/// instead of hanging on the slowest resolver.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Resolve `name`/`qtype` through a single `resolver`: dial it (composable bootstrap dial), run the
 /// DoH query, parse, and validate. Returns the validated public addresses, or an `io::Error` (which
 /// the smart-dialer funnels into the race's per-resolver failures).
@@ -56,7 +68,17 @@ pub async fn resolve(
     qtype: u16,
     pool: &[Resolver],
 ) -> Result<Vec<IpAddr>, ResolveError> {
-    match flint_dial::race_with(pool.len(), |i| resolve_one(&pool[i], name, qtype)).await {
+    match flint_dial::race_windowed(pool.len(), DEFAULT_WINDOW, |i| async move {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(&pool[i], name, qtype)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resolver attempt timed out",
+            )),
+        }
+    })
+    .await
+    {
         Ok((_winner, addrs)) => Ok(addrs),
         Err(_errors) => Err(ResolveError::AllFailed { tried: pool.len() }),
     }
@@ -84,7 +106,17 @@ pub async fn resolve_cached(
         }
     }
     // Slow path: race the whole pool and remember whoever wins.
-    match flint_dial::race_with(pool.len(), |i| resolve_one(&pool[i], name, qtype)).await {
+    match flint_dial::race_windowed(pool.len(), DEFAULT_WINDOW, |i| async move {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(&pool[i], name, qtype)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resolver attempt timed out",
+            )),
+        }
+    })
+    .await
+    {
         Ok((winner, addrs)) => {
             cache.record(network, &pool[winner].name);
             Ok(addrs)
@@ -96,6 +128,14 @@ pub async fn resolve_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolve_on_an_empty_pool_fails() {
+        // No network: an empty pool races nothing → AllFailed{0}. Proves resolve still funnels an
+        // all-fail race into ResolveError (now via the windowed, timeout-bounded path).
+        let err = resolve("example.com", TYPE_A, &[]).await.unwrap_err();
+        assert!(matches!(err, ResolveError::AllFailed { tried: 0 }));
+    }
 
     #[tokio::test]
     async fn resolve_cached_on_an_empty_pool_fails_without_network() {

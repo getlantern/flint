@@ -24,7 +24,7 @@ http = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "rt", "time"] }
 
 [dev-dependencies]
 # A local in-memory h2 server for the DoH round-trip test (no network).
