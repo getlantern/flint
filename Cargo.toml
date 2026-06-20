@@ -13,7 +13,7 @@ version = "0.0.0"
 edition = "2021"
 # Mirrors spark's MSRV: tun-rs 2.8.x (edition 2024) and the vendored netstack pin it to >= 1.85.
 rust-version = "1.85"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/getlantern/flint"
 
 # Shared deps for the foundation crates as they are populated (see docs/extraction-plan.md). Declared
