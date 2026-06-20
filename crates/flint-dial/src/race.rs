@@ -36,36 +36,28 @@ where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = io::Result<T>>,
 {
-    use futures::future::LocalBoxFuture;
-    use futures::FutureExt as _;
-
-    // `LocalBoxFuture<'_, (usize, io::Result<T>)>` is a type-erased pinned box that does not
-    // require `Send` or `'static`, giving both push sites the same concrete element type for
-    // `FuturesUnordered` without unsafe code and without new crate dependencies.
     let window = window.max(1);
-    let mut set: FuturesUnordered<LocalBoxFuture<'_, (usize, io::Result<T>)>> =
-        FuturesUnordered::new();
+    let mut set = FuturesUnordered::new();
     let mut next = 0;
-    while next < count && set.len() < window {
-        let i = next;
-        set.push(dial_one(i).map(move |r| (i, r)).boxed_local());
-        next += 1;
-    }
     let mut errors = Vec::new();
-    while let Some((i, res)) = set.next().await {
-        match res {
-            Ok(v) => return Ok((i, v)),
-            Err(e) => {
-                errors.push(e);
-                if next < count {
-                    let i = next;
-                    set.push(dial_one(i).map(move |r| (i, r)).boxed_local());
-                    next += 1;
-                }
-            }
+    loop {
+        // Refill the window up to capacity. There is exactly ONE `async move` push site in this
+        // function on purpose: two syntactically-distinct `async move` blocks are two anonymous
+        // types, which `FuturesUnordered<Fut>` (one element type) rejects (E0308). Keeping a single
+        // push site also keeps the wrapper future `Send` when `Fut`/`T` are — no boxing — which the
+        // downstream `#[async_trait]` resolvers require. Do NOT box with `LocalBoxFuture` (not `Send`).
+        while next < count && set.len() < window {
+            let i = next;
+            next += 1;
+            let fut = dial_one(i);
+            set.push(async move { (i, fut.await) });
+        }
+        match set.next().await {
+            Some((i, Ok(v))) => return Ok((i, v)),
+            Some((_, Err(e))) => errors.push(e),
+            None => return Err(errors),
         }
     }
-    Err(errors)
 }
 
 /// Race a slice of [`BootstrapStrategy`]s, returning the first that dials successfully (and its index
@@ -183,5 +175,13 @@ mod tests {
     async fn windowed_empty_yields_no_errors() {
         let res = race_windowed(0, 4, |_| async move { Ok::<i32, io::Error>(0) }).await;
         assert!(res.unwrap_err().is_empty());
+    }
+
+    #[test]
+    fn windowed_future_is_send() {
+        // race_windowed must return a Send future so #[async_trait] consumers can hold it across
+        // .await on a multi-thread runtime. This fails to compile if the impl uses a non-Send box.
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(race_windowed(1, 1, |_| async { Ok::<i32, io::Error>(0) }));
     }
 }
