@@ -37,10 +37,15 @@ other tools — depend back on flint. The extraction is sequenced to keep spark 
 
 ## Status
 
-Scaffold. The crates are stubs; primitives land one bounded, keep-green chunk at a time per the
-extraction plan. Pure-Rust, `rustls`+`ring` baseline; the boring Chrome-mimicry engine is
-feature-gated so the default build stays rustls-only. Binary-size-conscious (mirrors spark's locked
-stack).
+**Phase 1 complete** — all five crates are implemented and tested (the [extraction
+plan](docs/extraction-plan.md) tracks the phases). `flint-dns` resolves a real name by racing the DoH
+pool over composable bootstrap dials. Pure-Rust, `rustls`+`ring` baseline; the boring Chrome-mimicry
+engine is feature-gated so the default build stays rustls-only, and a weekly CI job keeps it tracking
+Chrome (`.github/workflows/update-mimicry.yml`, gated on the JA4 anchor).
+
+Remaining: the rustls baseline TLS engine, per-network caching of the winning dial, Ed25519-signed
+pool updates, and CDN-edge-fronted pool entries (design §6); then flipping the repo public and
+pointing spark at it (Phases 2–3). Binary-size-conscious (mirrors spark's locked stack).
 
 ## License
 

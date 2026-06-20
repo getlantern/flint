@@ -29,6 +29,10 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 # Concurrency combinators (FuturesUnordered) for the dial race. Locked stack: futures 0.3.
 futures = "0.3"
+# DoH over HTTP/2 (sans-hyper, matches spark): the H2 layer lives inside TLS so its fingerprint is
+# encrypted and not an evasion surface. `http` builds the request types.
+h2 = "0.4"
+http = "1"
 # Canonical binary codec for the gambit genome (matches spark's locked stack).
 postcard = { version = "1", features = ["use-std"] }
 # BoringSSL Chrome-mimicry TLS (the impersonation fork). Pulled ONLY by flint-tls's `boring` feature,

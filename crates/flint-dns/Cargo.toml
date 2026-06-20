@@ -7,4 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Use the boring Chrome-mimicry engine for the DoH dials (the default for DNS-over-TLS). Without it,
+# the codec/validation/pool are still usable but a live `resolve` dial returns Unsupported.
+boring = ["flint-dial/boring"]
+
 [dependencies]
+flint-dial = { path = "../flint-dial" }
+bytes = { workspace = true }
+futures = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+# A local in-memory h2 server for the DoH round-trip test (no network).
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
+h2 = { workspace = true }
+http = { workspace = true }
