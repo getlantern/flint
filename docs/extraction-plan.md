@@ -38,18 +38,37 @@ flint-verify     flint-shaping        flint-tls
 5. **`flint-dns`** — *new code*: the resilient DoH resolver (race → validate → per-network cache) + a
    minimal A/AAAA query/response codec; consumes flint-dial. (See `design.md` §6 and §10 build order.)
 
-Steps 1–3 are *moves* (keep spark green by swapping deps); 4–5 are *new* (flint-only until spark wires
-the resolver into its bootstrap path).
+Steps 1–3 are *moves* (the eventual spark swap replaces the in-tree module with a flint dep); 4–5 are
+*new* (flint-only until spark wires the resolver into its bootstrap path).
 
-## Consuming from spark
+## Sequencing (flint starts private)
 
-While iterating, spark depends on flint by git (or `path` for a local checkout):
+Because flint is **private at first**, spark cannot cleanly `git`-depend on it from CI without a
+deploy key / token, and committing a `path` dep into spark would break a standalone `spark` clone. So
+the extraction runs in two phases instead of interleaved flint-PR/spark-PR pairs:
+
+1. **Phase 1 — build flint out while private.** Land each crate (steps 1–5) in flint with its own
+   tests. spark is **untouched and stays green** the whole time; flint just *duplicates* the relevant
+   code until the swap. (`flint-verify` ✅ — step 1 done.)
+2. **Phase 2 — flip flint public**, dual-license MIT/Apache-2.0.
+3. **Phase 3 — spark swaps.** Per-crate PRs that point spark at the public flint by git, delete the
+   in-tree copy, and keep spark green (`cargo build` / `test` / `clippy -- -D warnings`).
+
+(If we instead want spark consuming flint *before* the flip, the alternatives are a git dep + a CI
+secret for the private repo, or a local-only `path` dep that is never committed to spark's main branch.)
+
+## Consuming from spark (Phase 3)
 
 ```toml
-# spark/core/Cargo.toml (during extraction)
-flint-verify  = { git = "https://github.com/getlantern/flint" }
-flint-shaping = { git = "https://github.com/getlantern/flint" }
-flint-tls     = { git = "https://github.com/getlantern/flint", features = ["boring"] }
+# spark/core/Cargo.toml — flint deps gated behind the matching feature, so the base build is unchanged
+[dependencies]
+flint-verify  = { git = "https://github.com/getlantern/flint", rev = "…", optional = true }
+flint-shaping = { git = "https://github.com/getlantern/flint", rev = "…" }
+flint-tls     = { git = "https://github.com/getlantern/flint", rev = "…", optional = true }
+
+[features]
+wasm-transport = ["dep:flint-verify", …]   # flint-verify only needed where the signed loader is
+anytls         = ["dep:flint-tls", …]       # the boring Chrome-CH engine
 ```
 
 Per the user's global Go-dep rule's spirit (pin + tidy together): pin each flint dep to a commit and
