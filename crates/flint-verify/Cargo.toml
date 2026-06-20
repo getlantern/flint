@@ -8,3 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Ed25519 verification (locked stack: ring). Same primitive spark's ModuleVerifier used. The signing
+# half (Ed25519KeyPair) is used only in tests/tooling; the production path never holds a private key.
+ring = { workspace = true }
+thiserror = { workspace = true }
