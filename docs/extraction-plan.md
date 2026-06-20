@@ -29,10 +29,14 @@ flint-verify     flint-shaping        flint-tls
 2. **`flint-shaping`** — move `core::transport::shaping` (`WirePlan`, `SegmentShapingStream` =
    `tcp_split`). Then **add `record_fragment`** (the new Layer-B TLS-record-fragmentation shim the
    design specs but spark never built). Spark swap: `shaping` → `flint_shaping`.
-3. **`flint-tls`** — move the Chrome-mimicry stack: `anytls::tls::configure` + `anytls::profile::Profile`
-   (the boring Chrome-137 connector), `gambit` (`ClientHello` / `Records` genome), `ja4`. Boring is
-   **feature-gated** (`boring`), default build rustls-only — mirrors spark's `anytls` feature. The
-   spark swap touches `anytls` *and* `samizdat` (both consume the connector); the most careful step.
+3. **`flint-tls`** ✅ — moved the Chrome-mimicry stack: the boring Chrome-137 connector (`connector`,
+   ex `anytls::tls`), `Profile` (the boring executor mapping), the `gambit` genome, `ja4`, and the
+   `anchor` JA4 drift test. Boring is **feature-gated** (`boring`, with `pq-experimental` +
+   `cert-compression`), default build rustls-only. The JA4 anchor reproduces spark's exact
+   `t13d1516h2_8daaf6152771_d8a2da3f94cd`. Auto-update of the mimicry libs is wired in CI
+   (`.github/workflows/update-mimicry.yml`): a weekly bump gated on build + the JA4 anchor. The spark
+   swap (Phase 3) touches `config`, `discovery`, `wasm`, `anytls`, *and* `samizdat` (all consume
+   `gambit`/`profile`/`ja4`/the connector); the most careful swap.
 4. **`flint-dial`** — *new code*: the composable engine that executes a `BootstrapStrategy` tuple over
    flint-tls + flint-shaping, with capability gating (boring Chrome-JA4 vs rustls real-ECH).
 5. **`flint-dns`** — *new code*: the resilient DoH resolver (race → validate → per-network cache) + a
@@ -49,7 +53,7 @@ the extraction runs in two phases instead of interleaved flint-PR/spark-PR pairs
 
 1. **Phase 1 — build flint out while private.** Land each crate (steps 1–5) in flint with its own
    tests. spark is **untouched and stays green** the whole time; flint just *duplicates* the relevant
-   code until the swap. (`flint-verify` ✅ — step 1 done.)
+   code until the swap. (`flint-verify` ✅, `flint-shaping` ✅, `flint-tls` ✅ — steps 1–3 done.)
 2. **Phase 2 — flip flint public**, dual-license MIT/Apache-2.0.
 3. **Phase 3 — spark swaps.** Per-crate PRs that point spark at the public flint by git, delete the
    in-tree copy, and keep spark green (`cargo build` / `test` / `clippy -- -D warnings`).

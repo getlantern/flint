@@ -1,0 +1,69 @@
+name: update-mimicry
+
+# Keep the Chrome-mimicry TLS libraries current with upstream so the ClientHello fingerprint tracks
+# real Chrome. Weekly (and on demand): bump boring2/tokio-boring2 to the latest upstream, verify the
+# build + tests + the JA4 anchor (the Chrome-fingerprint drift gate), and open a PR only if it passes.
+# A breaking upstream change (API rename or a JA4 drift) fails the run instead of opening a PR, so a
+# maintainer reviews it and, if the drift is real Chrome moving, re-validates and updates ANCHOR_JA4.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install BoringSSL build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      # Bump the Chrome-mimicry fork to the latest upstream, allowing breaking (major/minor) bumps —
+      # those are exactly the releases that track a new Chrome. Edits [workspace.dependencies].
+      - name: Bump Chrome-mimicry libs to latest upstream
+        run: cargo upgrade --incompatible --package boring2 --package tokio-boring2
+
+      # Gate the bump: the build must succeed (catches upstream API renames) and the JA4 anchor test
+      # must still match (catches a ClientHello fingerprint drift). If this fails, no PR is opened.
+      - name: Verify (build + tests + JA4 anchor)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy -p flint-tls --all-targets --features boring -- -D warnings
+          cargo test --workspace
+          cargo test -p flint-tls --features boring
+
+      - name: Open PR for the verified bump
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: auto/update-mimicry
+          title: "chore(flint-tls): bump Chrome-mimicry libs to latest upstream"
+          commit-message: "chore(flint-tls): bump boring2/tokio-boring2 to latest upstream"
+          labels: |
+            dependencies
+            automated
+          body: |
+            Automated weekly bump of the boring2 Chrome-mimicry fork so the ClientHello fingerprint
+            tracks real Chrome.
+
+            Verified **before** this PR was opened (the workflow gates on it):
+            - `cargo test --workspace` (base, rustls-only)
+            - `cargo test -p flint-tls --features boring` — including the **JA4 anchor test**
+              (`ANCHOR_JA4`), which fails if the ClientHello drifted from the Chrome-137 anchor.
+
+            If a future bump drifts the JA4 or breaks the build, the scheduled run fails and **no PR is
+            opened** — a maintainer then validates the new ClientHello against a real Chrome and updates
+            `ANCHOR_JA4` (see `crates/flint-tls/src/anchor.rs`).

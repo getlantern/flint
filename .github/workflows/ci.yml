@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # BoringSSL (the `boring` feature) builds from source via cmake. cmake/clang/go are present on
+      # ubuntu-latest, but install cmake explicitly so the boring build never silently lacks it.
+      - name: Install BoringSSL build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (base, rustls-only)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (flint-tls + boring)
+        run: cargo clippy -p flint-tls --all-targets --features boring -- -D warnings
+      - name: test (base, rustls-only)
+        run: cargo test --workspace
+      # Builds BoringSSL and runs the JA4 anchor test — the Chrome-fingerprint drift gate.
+      - name: test (flint-tls + boring, incl. JA4 anchor)
+        run: cargo test -p flint-tls --features boring

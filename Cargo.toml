@@ -26,6 +26,14 @@ bytes = "1"
 thiserror = "2"
 tracing = "0.1"
 ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+# Canonical binary codec for the gambit genome (matches spark's locked stack).
+postcard = { version = "1", features = ["use-std"] }
+# BoringSSL Chrome-mimicry TLS (the impersonation fork). Pulled ONLY by flint-tls's `boring` feature,
+# so default builds stay free of the C/cmake BoringSSL build. The update-mimicry CI bumps these to
+# track Chrome (see .github/workflows/update-mimicry.yml).
+boring2 = "4.15"
+tokio-boring2 = "4.15"
 
 # Mirrors spark's release profile (binary-size discipline). Only governs flint's own builds; a
 # consuming binary (spark) sets its own profile. Affects `--release` only, so `cargo test` (dev) keeps

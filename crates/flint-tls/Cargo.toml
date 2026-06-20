@@ -9,8 +9,29 @@ repository.workspace = true
 
 [features]
 default = []
-# The boring2 Chrome-mimicry engine. Off by default so the baseline build stays rustls/ring-only —
-# mirrors spark's `anytls` feature. Pulls boring2/tokio-boring2 when enabled (added at extraction step 3).
-boring = []
+# The boring2 Chrome-mimicry connector (and its JA4 anchor/drift test). Off by default so the base
+# build stays free of the C/cmake BoringSSL build; `gambit`, `profile`, and `ja4` are pure and always
+# compiled. The update-mimicry workflow bumps boring2/tokio-boring2 to track Chrome, then runs the
+# anchor test under this feature to catch fingerprint drift.
+boring = ["dep:boring2", "dep:tokio-boring2", "dep:tokio"]
 
 [dependencies]
+# gambit's Layer C reuses flint-shaping's WirePlan/SegmentSplit/DelaySpec (the genome ↔ shaper bridge).
+flint-shaping = { path = "../flint-shaping" }
+# Ed25519 (gambit SignedGambit) + SHA-256 (ja4). Locked stack: ring.
+ring = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+
+# Boring connector only (feature `boring`). tokio here is just the IO traits the connector is generic
+# over — no runtime features needed for the lib. boring2 features (match spark): `pq-experimental`
+# for the X25519MLKEM768 group, `cert-compression` for brotli cert compression — both part of the
+# Chrome-137 fingerprint.
+boring2 = { workspace = true, optional = true, features = ["pq-experimental", "cert-compression"] }
+tokio-boring2 = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+# `#[tokio::test]` for the boring anchor-capture test (only built under `--features boring`).
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
