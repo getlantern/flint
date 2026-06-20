@@ -8,3 +8,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Lean tokio for a reusable lib (not the workspace "full" set): the IO traits + the timer the Layer C
+# shaper uses for inter-segment delay. AsyncRead/AsyncWrite/ReadBuf + tokio::time::{sleep, Sleep}.
+tokio = { version = "1", default-features = false, features = ["io-util", "time"] }
+# CSPRNG for the inter-segment jitter delay (locked stack: ring).
+ring = { workspace = true }
+
+[dev-dependencies]
+# `#[tokio::test]` + `write_all` in tests.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "io-util", "time"] }
