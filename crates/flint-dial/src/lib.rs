@@ -24,7 +24,7 @@ mod race;
 mod strategy;
 
 pub use engine::{dial, dial_over};
-pub use race::{race, race_with};
+pub use race::{race, race_windowed, race_with};
 pub use strategy::{BootstrapStrategy, TlsEngine};
 
 /// A boxed, type-erased TLS byte stream — the output of a successful dial.
