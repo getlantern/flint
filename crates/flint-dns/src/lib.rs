@@ -19,11 +19,13 @@ pub mod cache;
 pub mod codec;
 pub mod doh;
 pub mod pool;
+pub mod signed;
 pub mod validate;
 
 pub use cache::ResolverCache;
 pub use codec::{TYPE_A, TYPE_AAAA};
 pub use pool::{default_pool, Resolver};
+pub use signed::{load_signed_pool, PoolUpdate};
 
 /// Why a resolution failed.
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +44,7 @@ pub enum ResolveError {
 pub async fn resolve_one(resolver: &Resolver, name: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
     let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
     let stream = flint_dial::dial(&resolver.strategy()).await?;
-    let response = doh::query(stream, resolver.host, resolver.path, &query).await?;
+    let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
     let answers = codec::parse_response(&response).map_err(io::Error::other)?;
     validate::validate_answers(answers).map_err(io::Error::other)
 }
@@ -84,7 +86,7 @@ pub async fn resolve_cached(
     // Slow path: race the whole pool and remember whoever wins.
     match flint_dial::race_with(pool.len(), |i| resolve_one(&pool[i], name, qtype)).await {
         Ok((winner, addrs)) => {
-            cache.record(network, pool[winner].name);
+            cache.record(network, &pool[winner].name);
             Ok(addrs)
         }
         Err(_errors) => Err(ResolveError::AllFailed { tried: pool.len() }),

@@ -43,11 +43,11 @@ pool over composable bootstrap dials. Pure-Rust, `rustls`+`ring` baseline; the b
 engine is feature-gated so the default build stays rustls-only, and a weekly CI job keeps it tracking
 Chrome (`.github/workflows/update-mimicry.yml`, gated on the JA4 anchor).
 
-Per-network caching of the winning dial and CDN-edge pool entries are in. Remaining: Ed25519-signed
-pool updates; the rustls baseline TLS engine is **deferred by design** — boring is the mimicry
-default and is used as much as possible, so rustls is only worth adding for real ECH (boring greases
-only) or a no-cmake fallback (design §11). Then flipping the repo public and pointing spark at it
-(Phases 2–3). Binary-size-conscious (mirrors spark's locked stack).
+Per-network caching of the winning dial, CDN-edge pool entries, and Ed25519-signed pool updates are
+all in. The rustls baseline TLS engine is **deferred by design** — boring is the mimicry default and
+is used as much as possible, so rustls is only worth adding for real ECH (boring greases only) or a
+no-cmake fallback (design §11). Next: flipping the repo public and pointing spark at it (Phases 2–3).
+Binary-size-conscious (mirrors spark's locked stack).
 
 ## License
 

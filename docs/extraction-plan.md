@@ -44,10 +44,11 @@ flint-verify     flint-shaping        flint-tls
    that dials to an explicit `Unsupported` (no silent fallback) — its connector lands in a follow-up
    (verify the rustls/tokio-rustls API first). Live end-to-end dial test arrives with flint-dns.
 5. **`flint-dns`** ✅ — *new code*: the resilient DoH resolver. Minimal A/AAAA wire codec, answer
-   validation (bogon/poison rejection), a diverse resolver pool (Cloudflare/Google/Quad9/Mullvad
-   raw-IP), DoH-over-HTTP/2 (`h2`, sans-hyper), and `resolve` = race the pool via flint-dial → first
-   *validated* answer. Per-network caching of the winning composition + Ed25519-signed pool updates
-   are follow-ups (design §6). Live end-to-end test is `#[ignore]`d (needs `boring` + network).
+   validation (bogon/poison rejection), a diverse resolver pool (CDN-edge + raw-IP across
+   Cloudflare/Google/Quad9/Mullvad), DoH-over-HTTP/2 (`h2`, sans-hyper), and `resolve` = race the pool
+   via flint-dial → first *validated* answer. Follow-ups now done: per-network caching
+   (`ResolverCache`/`resolve_cached`), CDN-edge pool entries, and Ed25519-signed pool updates
+   (`signed`, reusing flint-verify). Live end-to-end test is `#[ignore]`d (needs `boring` + network).
 
 Steps 1–3 are *moves* (the eventual spark swap replaces the in-tree module with a flint dep); 4–5 are
 *new* (flint-only until spark wires the resolver into its bootstrap path).

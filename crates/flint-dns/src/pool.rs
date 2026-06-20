@@ -18,26 +18,28 @@ use std::net::SocketAddr;
 
 use flint_dial::BootstrapStrategy;
 
-/// One DoH resolver, addressed for a raw-IP dial.
-#[derive(Debug, Clone)]
+/// One DoH resolver, addressed for a fixed-IP dial. Fields are **owned** (not `&'static str`) so a
+/// pool can be decoded from an Ed25519-signed update at runtime (see [`crate::signed`]), not only
+/// baked in. Serializable for that signed-blob payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Resolver {
     /// Short operator label (logs / metrics; never a secret).
-    pub name: &'static str,
+    pub name: String,
     /// The TCP endpoint to dial (the resolver IP, port 443).
     pub target: SocketAddr,
     /// The SNI to present in the ClientHello (the resolver hostname, covered by its cert).
-    pub sni: &'static str,
+    pub sni: String,
     /// The DoH `:authority` (HTTP host) — the resolver hostname.
-    pub host: &'static str,
+    pub host: String,
     /// The DoH path (RFC 8484), almost always `/dns-query`.
-    pub path: &'static str,
+    pub path: String,
 }
 
 impl Resolver {
     /// The bootstrap-dial strategy for this resolver: boring Chrome-mimicry to its IP, presenting its
     /// hostname as SNI, with no wire shaping (the dialer layers shaping on per network).
     pub fn strategy(&self) -> BootstrapStrategy {
-        BootstrapStrategy::boring_chrome(self.target, self.sni)
+        BootstrapStrategy::boring_chrome(self.target, self.sni.clone())
     }
 }
 
@@ -46,21 +48,18 @@ impl Resolver {
 /// when `sni != host` it is a fronted dial (camouflage SNI, real host in `:authority`). Domain
 /// fronting is blocked by some CDNs (Cloudflare/Google), so the default pool prefers `sni == host`
 /// CDN-edge entries.
-const fn entry(name: &'static str, ip: [u8; 4], sni: &'static str, host: &'static str) -> Resolver {
+fn entry(name: &str, ip: [u8; 4], sni: &str, host: &str) -> Resolver {
     Resolver {
-        name,
-        target: SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])),
-            443,
-        ),
-        sni,
-        host,
-        path: "/dns-query",
+        name: name.to_owned(),
+        target: SocketAddr::from((ip, 443)),
+        sni: sni.to_owned(),
+        host: host.to_owned(),
+        path: "/dns-query".to_owned(),
     }
 }
 
 /// A plain raw-IP / CDN-edge entry (SNI == DoH host).
-const fn v4(name: &'static str, ip: [u8; 4], host: &'static str) -> Resolver {
+fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
     entry(name, ip, host, host)
 }
 
@@ -104,7 +103,7 @@ mod tests {
             assert_eq!(r.strategy().engine.kind(), "boring-chrome");
         }
         // Operator diversity (not all one provider).
-        let hosts: std::collections::HashSet<_> = pool.iter().map(|r| r.host).collect();
+        let hosts: std::collections::HashSet<_> = pool.iter().map(|r| r.host.as_str()).collect();
         assert!(hosts.len() >= 4, "pool should span several operators");
     }
 
