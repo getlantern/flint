@@ -15,11 +15,13 @@
 use std::io;
 use std::net::IpAddr;
 
+pub mod cache;
 pub mod codec;
 pub mod doh;
 pub mod pool;
 pub mod validate;
 
+pub use cache::ResolverCache;
 pub use codec::{TYPE_A, TYPE_AAAA};
 pub use pool::{default_pool, Resolver};
 
@@ -58,10 +60,50 @@ pub async fn resolve(
     }
 }
 
+/// Like [`resolve`], but caches the winning resolver per network ([`ResolverCache`]). On a cache hit
+/// it tries the known-good resolver for `network` first (one shot, no race); on a miss or that
+/// resolver failing, it races the full pool and records the new winner. `network` is the caller's
+/// network fingerprint (see [`ResolverCache`]). This is the steady-state fast path.
+pub async fn resolve_cached(
+    name: &str,
+    qtype: u16,
+    pool: &[Resolver],
+    cache: &ResolverCache,
+    network: &str,
+) -> Result<Vec<IpAddr>, ResolveError> {
+    // Fast path: the resolver that last worked on this network.
+    if let Some(winner) = cache.winner(network) {
+        if let Some(resolver) = pool.iter().find(|r| r.name == winner) {
+            if let Ok(addrs) = resolve_one(resolver, name, qtype).await {
+                return Ok(addrs);
+            }
+            // The cached winner failed — drop it and fall through to a full re-race.
+            cache.forget(network);
+        }
+    }
+    // Slow path: race the whole pool and remember whoever wins.
+    match flint_dial::race_with(pool.len(), |i| resolve_one(&pool[i], name, qtype)).await {
+        Ok((winner, addrs)) => {
+            cache.record(network, pool[winner].name);
+            Ok(addrs)
+        }
+        Err(_errors) => Err(ResolveError::AllFailed { tried: pool.len() }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "boring")]
     use super::*;
+
+    #[tokio::test]
+    async fn resolve_cached_on_an_empty_pool_fails_without_network() {
+        // No cached winner + empty pool → race nothing → AllFailed{0}. No network touched.
+        let cache = ResolverCache::new();
+        let err = resolve_cached("example.com", TYPE_A, &[], &cache, "net-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::AllFailed { tried: 0 }));
+    }
 
     /// Live end-to-end resolution through the real default pool. Requires the `boring` feature and
     /// network egress, so it is `#[ignore]`d in CI — run with

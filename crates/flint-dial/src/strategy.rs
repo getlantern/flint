@@ -15,8 +15,11 @@ pub enum TlsEngine {
     /// boring2 Chrome-137 mimicry, shaped by a [`Profile`] (the default for DNS-over-TLS, §7).
     /// Realized only with the `boring` feature; otherwise the dial returns `Unsupported`.
     BoringChrome(Profile),
-    /// The rustls baseline (real-ECH capable). Not yet implemented — a documented follow-up; a dial
-    /// with this engine currently returns `Unsupported` rather than silently using boring.
+    /// The rustls baseline (pure-Rust, real-ECH capable). **Deferred** — boring is the mimicry
+    /// default and is used as much as possible; rustls exists only for the two things boring can't do
+    /// (real ECH — boring only greases — and a no-cmake/odd-platform fallback). Until it's needed, a
+    /// dial with this engine returns `Unsupported` rather than silently downgrading off Chrome
+    /// mimicry. Revisit for real ECH, ideally once boring2 gains it (design §11).
     Rustls,
 }
 
