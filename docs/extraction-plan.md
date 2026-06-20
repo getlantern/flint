@@ -37,8 +37,12 @@ flint-verify     flint-shaping        flint-tls
    (`.github/workflows/update-mimicry.yml`): a weekly bump gated on build + the JA4 anchor. The spark
    swap (Phase 3) touches `config`, `discovery`, `wasm`, `anytls`, *and* `samizdat` (all consume
    `gambit`/`profile`/`ja4`/the connector); the most careful swap.
-4. **`flint-dial`** — *new code*: the composable engine that executes a `BootstrapStrategy` tuple over
-   flint-tls + flint-shaping, with capability gating (boring Chrome-JA4 vs rustls real-ECH).
+4. **`flint-dial`** ✅ — *new code*: the composable engine. `BootstrapStrategy` (target × SNI × engine
+   × wire plan) executed by `dial`/`dial_over` (wire-shape → TLS handshake) over flint-tls +
+   flint-shaping, plus a generic `race`/`race_with` happy-eyeballs combinator. The **boring Chrome**
+   engine works (feature `boring`); the **rustls baseline** is a defined-but-unimplemented variant
+   that dials to an explicit `Unsupported` (no silent fallback) — its connector lands in a follow-up
+   (verify the rustls/tokio-rustls API first). Live end-to-end dial test arrives with flint-dns.
 5. **`flint-dns`** — *new code*: the resilient DoH resolver (race → validate → per-network cache) + a
    minimal A/AAAA query/response codec; consumes flint-dial. (See `design.md` §6 and §10 build order.)
 
@@ -53,7 +57,8 @@ the extraction runs in two phases instead of interleaved flint-PR/spark-PR pairs
 
 1. **Phase 1 — build flint out while private.** Land each crate (steps 1–5) in flint with its own
    tests. spark is **untouched and stays green** the whole time; flint just *duplicates* the relevant
-   code until the swap. (`flint-verify` ✅, `flint-shaping` ✅, `flint-tls` ✅ — steps 1–3 done.)
+   code until the swap. (`flint-verify` ✅, `flint-shaping` ✅, `flint-tls` ✅, `flint-dial` ✅ —
+   steps 1–4 done; `flint-dns` is step 5.)
 2. **Phase 2 — flip flint public**, dual-license MIT/Apache-2.0.
 3. **Phase 3 — spark swaps.** Per-crate PRs that point spark at the public flint by git, delete the
    in-tree copy, and keep spark green (`cargo build` / `test` / `clippy -- -D warnings`).

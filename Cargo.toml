@@ -27,6 +27,8 @@ thiserror = "2"
 tracing = "0.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
+# Concurrency combinators (FuturesUnordered) for the dial race. Locked stack: futures 0.3.
+futures = "0.3"
 # Canonical binary codec for the gambit genome (matches spark's locked stack).
 postcard = { version = "1", features = ["use-std"] }
 # BoringSSL Chrome-mimicry TLS (the impersonation fork). Pulled ONLY by flint-tls's `boring` feature,

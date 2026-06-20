@@ -7,4 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enable the boring2 Chrome-mimicry TLS engine (the default for DNS-over-TLS). Without it, a
+# `BoringChrome` strategy dials to an explicit Unsupported error; the model + race are always available.
+boring = ["flint-tls/boring"]
+
 [dependencies]
+flint-shaping = { path = "../flint-shaping" }
+flint-tls = { path = "../flint-tls" }
+futures = { workspace = true }
+thiserror = { workspace = true }
+# TcpStream (the default connect) + the IO traits the shaping/TLS layers are generic over.
+tokio = { version = "1", default-features = false, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "io-util", "time"] }
