@@ -108,6 +108,10 @@ pub async fn resolve_cached(
             }
             // The cached winner failed or timed out — drop it and fall through to a full re-race.
             cache.forget(network);
+        } else {
+            // The cached winner is no longer in `pool` (pool updated/reordered) — drop the stale
+            // entry so the cache self-heals instead of missing the lookup on every call.
+            cache.forget(network);
         }
     }
     // Slow path: race the whole pool and remember whoever wins.
