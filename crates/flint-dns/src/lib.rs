@@ -95,13 +95,18 @@ pub async fn resolve_cached(
     cache: &ResolverCache,
     network: &str,
 ) -> Result<Vec<IpAddr>, ResolveError> {
-    // Fast path: the resolver that last worked on this network.
+    // Fast path: the resolver that last worked on this network — bounded by the same per-attempt
+    // timeout as the pool race, so a now-blackholed/filtered cached winner can't hang here
+    // indefinitely. A timeout is treated exactly like a failure: forget the winner and fall through
+    // to the full re-race (otherwise ATTEMPT_TIMEOUT would be defeated on the cached path).
     if let Some(winner) = cache.winner(network) {
         if let Some(resolver) = pool.iter().find(|r| r.name == winner) {
-            if let Ok(addrs) = resolve_one(resolver, name, qtype).await {
+            if let Ok(Ok(addrs)) =
+                tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(resolver, name, qtype)).await
+            {
                 return Ok(addrs);
             }
-            // The cached winner failed — drop it and fall through to a full re-race.
+            // The cached winner failed or timed out — drop it and fall through to a full re-race.
             cache.forget(network);
         }
     }
