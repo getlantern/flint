@@ -83,6 +83,10 @@ where
             let i = next;
             next += 1;
             let fut = probe_one(i);
+            // Exactly ONE `async move` push site (as in `race_windowed`): two syntactically-distinct
+            // `async move` blocks are two anonymous types, which `FuturesUnordered<_>` (one element
+            // type) rejects (E0308). A single site also keeps the returned future `Send` when `Fut`/
+            // `T` are — no boxing. Don't add a second push site or box with `LocalBoxFuture`.
             set.push(async move { (i, fut.await) });
         }
         match set.next().await {
