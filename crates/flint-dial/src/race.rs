@@ -60,6 +60,38 @@ where
     }
 }
 
+/// Run all `count` probes with at most `window` in flight, refilling as each finishes, and return
+/// **every** result paired with its index (unlike [`race_windowed`], which returns only the first
+/// `Ok`). Order of the returned vec is completion order; sort by index if you need positional order.
+/// `window` is clamped to at least 1; `count == 0` yields an empty vec. Used to probe a server pool
+/// in bounded batches and rank the results.
+pub async fn probe_windowed<F, Fut, T>(
+    count: usize,
+    window: usize,
+    mut probe_one: F,
+) -> Vec<(usize, T)>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let window = window.max(1);
+    let mut set = FuturesUnordered::new();
+    let mut next = 0;
+    let mut out = Vec::with_capacity(count);
+    loop {
+        while next < count && set.len() < window {
+            let i = next;
+            next += 1;
+            let fut = probe_one(i);
+            set.push(async move { (i, fut.await) });
+        }
+        match set.next().await {
+            Some(result) => out.push(result),
+            None => return out,
+        }
+    }
+}
+
 /// Race a slice of [`BootstrapStrategy`]s, returning the first that dials successfully (and its index
 /// into `strategies`), or every error if all fail. Concurrent — the slower compositions are cancelled
 /// once one connects.
@@ -183,5 +215,54 @@ mod tests {
         // .await on a multi-thread runtime. This fails to compile if the impl uses a non-Send box.
         fn assert_send<T: Send>(_: T) {}
         assert_send(race_windowed(1, 1, |_| async { Ok::<i32, io::Error>(0) }));
+    }
+
+    #[tokio::test]
+    async fn probe_windowed_returns_all_results_with_indices() {
+        // 6 probes, window 2; each returns its index doubled. All 6 results come back, indexed.
+        let mut got = probe_windowed(6, 2, |i| async move { i * 10 }).await;
+        got.sort_by_key(|(i, _)| *i);
+        assert_eq!(
+            got,
+            vec![(0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_windowed_never_exceeds_the_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let got = probe_windowed(10, 3, |_| {
+            let inflight = Arc::clone(&inflight);
+            let max_seen = Arc::clone(&max_seen);
+            async move {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(got.len(), 10);
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 3,
+            "max in flight {} > window",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_windowed_empty_is_empty() {
+        let got: Vec<(usize, i32)> = probe_windowed(0, 4, |_| async move { 0 }).await;
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn probe_windowed_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(probe_windowed(1, 1, |_| async { 0i32 }));
     }
 }
