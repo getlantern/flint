@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_windowed_returns_all_results_with_indices() {
-        // 6 probes, window 2; each returns its index doubled. All 6 results come back, indexed.
+        // 6 probes, window 2; each returns ten times its index. All 6 results come back, indexed.
         let mut got = probe_windowed(6, 2, |i| async move { i * 10 }).await;
         got.sort_by_key(|(i, _)| *i);
         assert_eq!(
