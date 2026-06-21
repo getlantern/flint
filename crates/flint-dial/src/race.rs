@@ -13,27 +13,51 @@ use crate::{BootstrapStrategy, BoxedTlsStream};
 ///
 /// Generic over the dial so it is unit-testable without a network and reusable beyond TLS. `count == 0`
 /// yields `Err(vec![])`.
-pub async fn race_with<F, Fut, T>(
+pub async fn race_with<F, Fut, T>(count: usize, dial_one: F) -> Result<(usize, T), Vec<io::Error>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    // Unbounded == a window as wide as the field.
+    race_windowed(count, count, dial_one).await
+}
+
+/// Like [`race_with`] but with **bounded concurrency**: at most `window` dials are in flight at once,
+/// refilling as each finishes, so a large `count` doesn't open every connection simultaneously
+/// (design §3.1). Returns `(winning_index, value)` for the first `Ok`; the losers are dropped. If all
+/// fail, returns every error in completion order. `window` is clamped to at least 1; `count == 0`
+/// yields `Err(vec![])`. With `window >= count` this is exactly [`race_with`] (unbounded).
+pub async fn race_windowed<F, Fut, T>(
     count: usize,
+    window: usize,
     mut dial_one: F,
 ) -> Result<(usize, T), Vec<io::Error>>
 where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = io::Result<T>>,
 {
+    let window = window.max(1);
     let mut set = FuturesUnordered::new();
-    for i in 0..count {
-        let fut = dial_one(i);
-        set.push(async move { (i, fut.await) });
-    }
+    let mut next = 0;
     let mut errors = Vec::new();
-    while let Some((i, res)) = set.next().await {
-        match res {
-            Ok(v) => return Ok((i, v)),
-            Err(e) => errors.push(e),
+    loop {
+        // Refill the window up to capacity. There is exactly ONE `async move` push site in this
+        // function on purpose: two syntactically-distinct `async move` blocks are two anonymous
+        // types, which `FuturesUnordered<Fut>` (one element type) rejects (E0308). Keeping a single
+        // push site also keeps the wrapper future `Send` when `Fut`/`T` are — no boxing — which the
+        // downstream `#[async_trait]` resolvers require. Do NOT box with `LocalBoxFuture` (not `Send`).
+        while next < count && set.len() < window {
+            let i = next;
+            next += 1;
+            let fut = dial_one(i);
+            set.push(async move { (i, fut.await) });
+        }
+        match set.next().await {
+            Some((i, Ok(v))) => return Ok((i, v)),
+            Some((_, Err(e))) => errors.push(e),
+            None => return Err(errors),
         }
     }
-    Err(errors)
 }
 
 /// Race a slice of [`BootstrapStrategy`]s, returning the first that dials successfully (and its index
@@ -88,5 +112,76 @@ mod tests {
     async fn empty_set_yields_no_errors() {
         let res = race_with(0, |_| async move { Ok::<i32, io::Error>(0) }).await;
         assert!(res.unwrap_err().is_empty());
+    }
+
+    #[tokio::test]
+    async fn windowed_never_exceeds_the_window_and_runs_all() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        // 10 dials, window 3, all fail → every dial runs (10 errors) but never >3 concurrently.
+        let res = race_windowed(10, 3, |_| {
+            let inflight = Arc::clone(&inflight);
+            let max_seen = Arc::clone(&max_seen);
+            async move {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Err::<i32, _>(io::Error::other("decline"))
+            }
+        })
+        .await;
+        assert_eq!(res.unwrap_err().len(), 10, "all dials should run");
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 3,
+            "max in flight {} exceeded the window",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn windowed_first_ok_wins_with_refill() {
+        // Window 2; index 5 is the only Ok. It can only start after earlier failures refill the
+        // window, so this also exercises refill. It must still win.
+        let res = race_windowed(8, 2, |i| async move {
+            if i == 5 {
+                Ok::<_, io::Error>(55)
+            } else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Err(io::Error::other("decline"))
+            }
+        })
+        .await;
+        assert_eq!(res.unwrap().1, 55);
+    }
+
+    #[tokio::test]
+    async fn windowed_with_window_larger_than_count_is_unbounded() {
+        let res = race_windowed(3, 99, |i| async move {
+            if i == 2 {
+                Ok::<_, io::Error>(2)
+            } else {
+                Err(io::Error::other("x"))
+            }
+        })
+        .await;
+        assert_eq!(res.unwrap(), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn windowed_empty_yields_no_errors() {
+        let res = race_windowed(0, 4, |_| async move { Ok::<i32, io::Error>(0) }).await;
+        assert!(res.unwrap_err().is_empty());
+    }
+
+    #[test]
+    fn windowed_future_is_send() {
+        // race_windowed must return a Send future so #[async_trait] consumers can hold it across
+        // .await on a multi-thread runtime. This fails to compile if the impl uses a non-Send box.
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(race_windowed(1, 1, |_| async { Ok::<i32, io::Error>(0) }));
     }
 }
