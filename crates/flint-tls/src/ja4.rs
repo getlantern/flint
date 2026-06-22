@@ -26,6 +26,9 @@ use ring::digest;
 pub struct ClientHelloSummary {
     /// `legacy_version` from the ClientHello body (the JA4 version when no `supported_versions`).
     pub legacy_version: u16,
+    /// The `legacy_session_id` (0–32 bytes), as carried on the wire. Not part of the JA4 itself, but
+    /// surfaced so a `session_id`-injection test can assert the bytes the connector stamped.
+    pub legacy_session_id: Vec<u8>,
     /// The `supported_versions` (0x002b) list, if present (JA4 uses its highest non-GREASE value).
     pub supported_versions: Option<Vec<u16>>,
     /// Whether the `server_name` (0x0000) extension is present.
@@ -197,7 +200,7 @@ pub fn parse_client_hello(record: &[u8]) -> Option<ClientHelloSummary> {
     let legacy_version = c.u16()?;
     c.skip(32)?;
     let sid = c.u8()? as usize;
-    c.skip(sid)?;
+    let legacy_session_id = c.take(sid)?.to_vec();
     // cipher_suites: len(2) then len/2 u16s.
     let cs_len = c.u16()? as usize;
     if cs_len % 2 != 0 {
@@ -213,6 +216,7 @@ pub fn parse_client_hello(record: &[u8]) -> Option<ClientHelloSummary> {
 
     let mut summary = ClientHelloSummary {
         legacy_version,
+        legacy_session_id,
         supported_versions: None,
         sni: false,
         ciphers,
