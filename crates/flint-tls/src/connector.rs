@@ -178,7 +178,11 @@ fn ids_to_extension_types(ids: &[u16]) -> Vec<ExtensionType> {
         .map(|&id| {
             let ext = ExtensionType::from(id);
             if ExtensionType::index_of(ext).is_none() {
-                tracing::warn!(ext = id, "gambit extension id not mapped; skipping");
+                tracing::warn!(
+                    ext = id,
+                    "gambit extension id not in boring's permutation table; forwarding it but \
+                     boring will not reorder it"
+                );
             }
             ext
         })
