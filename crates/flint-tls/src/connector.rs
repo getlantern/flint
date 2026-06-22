@@ -257,11 +257,18 @@ pub fn inject_session_id(config: &mut ConnectConfiguration, id: &[u8; 32]) -> io
             boring_sys2::SSL_SESSION_free(sess);
             return Err(io::Error::other("flint-tls: kID session setup failed"));
         }
-        // Keep the session "time-valid" so it is offered, not dropped as expired.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Keep the session "time-valid" so it is offered, not dropped as expired. A clock before the
+        // Unix epoch would stamp a stale time and silently drop the injection; surface that as an
+        // explicit error (freeing the session we own first) rather than fail silently with `0`.
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => {
+                boring_sys2::SSL_SESSION_free(sess);
+                return Err(io::Error::other(
+                    "flint-tls: system clock is before the Unix epoch",
+                ));
+            }
+        };
         boring_sys2::SSL_SESSION_set_time(sess, now);
         boring_sys2::SSL_SESSION_set_timeout(sess, SESSION_TIMEOUT_SECS);
 
