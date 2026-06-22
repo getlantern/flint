@@ -73,6 +73,10 @@ pub enum RecordFragment {
     SniStraddle,
     /// Fragment the ClientHello's record payload into chunks of at most `usize` bytes each.
     Chunks(usize),
+    /// Fragment the ClientHello's record payload at these absolute payload byte offsets, emitting a
+    /// separate TLS record per piece. Offsets are sorted+deduped and clamped to `(0, payload_len)`;
+    /// an empty list is a no-op. (Gambit Layer B `records.split_offsets`.)
+    Offsets(Vec<usize>),
 }
 
 /// The opening-handshake shaping genome: how to frame and time the ClientHello on the wire.
@@ -97,7 +101,11 @@ pub struct WirePlan {
 impl WirePlan {
     /// True if the plan does no shaping at all (then both stream wrappers are pure passthroughs).
     pub fn is_noop(&self) -> bool {
-        matches!(self.segment_split, SegmentSplit::None)
-            && matches!(self.record_fragment, RecordFragment::None)
+        let record_noop = match &self.record_fragment {
+            RecordFragment::None => true,
+            RecordFragment::Offsets(offs) => offs.is_empty(),
+            _ => false,
+        };
+        matches!(self.segment_split, SegmentSplit::None) && record_noop
     }
 }
