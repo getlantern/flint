@@ -13,7 +13,18 @@ default = []
 # build stays free of the C/cmake BoringSSL build; `gambit`, `profile`, and `ja4` are pure and always
 # compiled. The update-mimicry workflow bumps boring2/tokio-boring2 to track Chrome, then runs the
 # anchor test under this feature to catch fingerprint drift.
-boring = ["dep:boring2", "dep:tokio-boring2", "dep:tokio"]
+# `boring-sys2` (the raw FFI) is pulled in so the connector can run the `legacy_session_id`-injection
+# (`kID`) recipe, which boring2 exposes no high-level API for; `foreign-types-shared` brings the
+# `ForeignTypeRef::as_ptr` method on boring2's `SslRef` into scope. `tracing` lets the gambit-knob
+# appliers warn-and-skip an id boring can't realize (connectivity must never depend on a knob).
+boring = [
+    "dep:boring2",
+    "dep:boring-sys2",
+    "dep:tokio-boring2",
+    "dep:tokio",
+    "dep:foreign-types-shared",
+    "dep:tracing",
+]
 
 [dependencies]
 # gambit's Layer C reuses flint-shaping's WirePlan/SegmentSplit/DelaySpec (the genome ↔ shaper bridge).
@@ -31,6 +42,13 @@ thiserror = { workspace = true }
 boring2 = { workspace = true, optional = true, features = ["pq-experimental", "cert-compression"] }
 tokio-boring2 = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, optional = true }
+# Raw BoringSSL FFI for the `legacy_session_id` (`kID`) injection — pinned to the SAME version as
+# boring2 (4.15.x) so they share one BoringSSL build. `foreign-types-shared` provides the
+# `ForeignTypeRef` trait whose `as_ptr` we call on boring2's `SslRef` (boring2 uses foreign-types 0.5
+# ⇒ shared 0.3).
+boring-sys2 = { workspace = true, optional = true }
+foreign-types-shared = { version = "0.3", optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `#[tokio::test]` for the boring anchor-capture test (only built under `--features boring`).

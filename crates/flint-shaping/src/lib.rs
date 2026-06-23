@@ -73,6 +73,10 @@ pub enum RecordFragment {
     SniStraddle,
     /// Fragment the ClientHello's record payload into chunks of at most `usize` bytes each.
     Chunks(usize),
+    /// Fragment the ClientHello's record payload at these absolute payload byte offsets, emitting a
+    /// separate TLS record per piece. Offsets are sorted+deduped and clamped to `(0, payload_len)`;
+    /// an empty (or all-zero) list is a no-op. (Gambit Layer B `records.split_offsets`.)
+    Offsets(Vec<usize>),
 }
 
 /// The opening-handshake shaping genome: how to frame and time the ClientHello on the wire.
@@ -96,8 +100,38 @@ pub struct WirePlan {
 
 impl WirePlan {
     /// True if the plan does no shaping at all (then both stream wrappers are pure passthroughs).
+    ///
+    /// This detects *structural* no-ops only. For `Offsets`, an offset of 0 is always dropped at
+    /// runtime (a cut at the start fragments nothing), so all-zero (or empty) offsets are a no-op;
+    /// offsets that fall out of bounds of a *specific* payload also drop at runtime, but that
+    /// depends on the payload length and so isn't detected here.
     pub fn is_noop(&self) -> bool {
-        matches!(self.segment_split, SegmentSplit::None)
-            && matches!(self.record_fragment, RecordFragment::None)
+        let record_noop = match &self.record_fragment {
+            RecordFragment::None => true,
+            RecordFragment::Offsets(offs) => offs.iter().all(|&o| o == 0),
+            _ => false,
+        };
+        matches!(self.segment_split, SegmentSplit::None) && record_noop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_noop_detects_structural_record_noops() {
+        let plan = |rf| WirePlan {
+            record_fragment: rf,
+            ..Default::default()
+        };
+        assert!(plan(RecordFragment::None).is_noop());
+        assert!(plan(RecordFragment::Offsets(vec![])).is_noop());
+        // Offset 0 is always dropped at runtime, so all-zero offsets do no fragmentation.
+        assert!(plan(RecordFragment::Offsets(vec![0])).is_noop());
+        assert!(plan(RecordFragment::Offsets(vec![0, 0])).is_noop());
+        // A non-zero cut is real shaping.
+        assert!(!plan(RecordFragment::Offsets(vec![10])).is_noop());
+        assert!(!plan(RecordFragment::Offsets(vec![0, 10])).is_noop());
     }
 }

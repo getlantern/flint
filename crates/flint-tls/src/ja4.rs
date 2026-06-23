@@ -26,6 +26,9 @@ use ring::digest;
 pub struct ClientHelloSummary {
     /// `legacy_version` from the ClientHello body (the JA4 version when no `supported_versions`).
     pub legacy_version: u16,
+    /// The `legacy_session_id` (0–32 bytes), as carried on the wire. Not part of the JA4 itself, but
+    /// surfaced so a `session_id`-injection test can assert the bytes the connector stamped.
+    pub legacy_session_id: Vec<u8>,
     /// The `supported_versions` (0x002b) list, if present (JA4 uses its highest non-GREASE value).
     pub supported_versions: Option<Vec<u16>>,
     /// Whether the `server_name` (0x0000) extension is present.
@@ -197,7 +200,10 @@ pub fn parse_client_hello(record: &[u8]) -> Option<ClientHelloSummary> {
     let legacy_version = c.u16()?;
     c.skip(32)?;
     let sid = c.u8()? as usize;
-    c.skip(sid)?;
+    if sid > 32 {
+        return None; // TLS legacy_session_id is limited to 0–32 bytes; reject out-of-spec input.
+    }
+    let legacy_session_id = c.take(sid)?.to_vec();
     // cipher_suites: len(2) then len/2 u16s.
     let cs_len = c.u16()? as usize;
     if cs_len % 2 != 0 {
@@ -213,6 +219,7 @@ pub fn parse_client_hello(record: &[u8]) -> Option<ClientHelloSummary> {
 
     let mut summary = ClientHelloSummary {
         legacy_version,
+        legacy_session_id,
         supported_versions: None,
         sni: false,
         ciphers,
@@ -434,5 +441,23 @@ mod tests {
         for n in 0..ch.len() {
             assert_eq!(ja4_of_record(&ch[..n]), None, "prefix len {n}");
         }
+    }
+
+    #[test]
+    fn rejects_oversized_session_id() {
+        // TLS legacy_session_id is capped at 0–32 bytes. A length byte > 32 is out-of-spec and must
+        // be rejected before the bytes are read, even though a u8 could carry up to 255.
+        let mut ch = build_ch(0x0303, &[0x1301], &[(0x002b, vec![0x02, 0x03, 0x04])]);
+        assert!(
+            parse_client_hello(&ch).is_some(),
+            "baseline CH should parse"
+        );
+        // session_id length byte: record header (5) + handshake header (4) + legacy_version (2) +
+        // random (32) = offset 43 (build_ch sets it to 0).
+        ch[43] = 33;
+        assert!(
+            parse_client_hello(&ch).is_none(),
+            "session_id length > 32 must be rejected",
+        );
     }
 }

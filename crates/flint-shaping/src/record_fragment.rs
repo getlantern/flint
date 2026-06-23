@@ -78,6 +78,9 @@ fn payload_cuts(frag: &RecordFragment, buf: &[u8], payload: &[u8]) -> Vec<usize>
             }
             cuts
         }
+        // `ranges` sorts, dedups, and clamps to `(0, payload_len)`, so an offset == 0 or
+        // >= payload_len is dropped and an empty list yields no cut.
+        RecordFragment::Offsets(offs) => offs.clone(),
         RecordFragment::SniStraddle => match sni::sni_host_range(buf) {
             // `off` is absolute in `buf`; the payload starts at RECORD_HEADER_LEN, so the host's
             // payload-relative midpoint is `(off - RECORD_HEADER_LEN) + len/2`. Cut there so the host
@@ -329,6 +332,27 @@ mod tests {
             host_start < cut && cut < host_start + len,
             "record boundary is inside the hostname"
         );
+    }
+
+    #[tokio::test]
+    async fn offsets_fragments_the_clienthello_at_given_cuts() {
+        // A fake ClientHello record: 16 03 01 <len:2> <payload>. Offsets are into the *payload*.
+        let payload = (0..30u8).collect::<Vec<_>>();
+        let mut rec = vec![0x16, 0x03, 0x01, 0x00, payload.len() as u8];
+        rec.extend_from_slice(&payload);
+
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let mut s =
+            RecordFragmentingStream::new(recorder, plan(RecordFragment::Offsets(vec![10, 20])));
+        s.write_all(&rec).await.unwrap();
+
+        let payloads = record_payloads(&flatten(&writes));
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads.concat(), payload);
+        assert_eq!(payloads[0].len(), 10);
+        assert_eq!(payloads[1].len(), 10);
+        assert_eq!(payloads[2].len(), 10);
     }
 
     #[tokio::test]

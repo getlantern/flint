@@ -40,6 +40,9 @@ postcard = { version = "1", features = ["use-std"] }
 # track Chrome (see .github/workflows/update-mimicry.yml).
 boring2 = "4.15"
 tokio-boring2 = "4.15"
+# Raw BoringSSL FFI: the `legacy_session_id`/`kID` injection has no boring2 high-level API. Pinned to
+# the same 4.15 line as boring2 so they share one vendored BoringSSL build.
+boring-sys2 = "4.15"
 
 # Mirrors spark's release profile (binary-size discipline). Only governs flint's own builds; a
 # consuming binary (spark) sets its own profile. Affects `--release` only, so `cargo test` (dev) keeps

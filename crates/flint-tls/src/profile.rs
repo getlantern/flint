@@ -8,10 +8,13 @@
 //! byte-builder / a patched fork).
 //!
 //! What boring2 4.15 expresses (verified against the crate source): GREASE on/off, extension
-//! permutation on/off (no seed control), the supported-groups list (so PQ X25519MLKEM768 is
-//! includable), `record_size_limit`, ECH grease, ALPS. What it does **not**: explicit extension/
-//! cipher order by id, an exact GREASE/permutation seed, ClientHello padding-to-length,
-//! `legacy_session_id` injection, and TLS-record split offsets.
+//! permutation on/off (no seed control), **explicit extension order by id**
+//! (`set_extension_permutation`), **explicit cipher order by id** (ordered `set_cipher_list`), the
+//! supported-groups list (so PQ X25519MLKEM768 is includable), `record_size_limit`, ECH grease,
+//! ALPS, and **`legacy_session_id` injection** (the kID recipe in [`crate::connector`]); TLS-record
+//! split offsets are realized one layer down by `flint_shaping`. What it still does **not** (P4b /
+//! await the byte-builder or a patched fork): an exact GREASE/permutation seed, ClientHello
+//! padding-to-length, and a raw ClientHello.
 //!
 //! Pure data mapping — no boring dependency. The resulting [`Profile`] (plain on/off values) is what
 //! [`crate::connector`] applies to the boring connector under the `boring` feature.
@@ -19,10 +22,14 @@
 use crate::gambit::{Capability, ClientHello, EchMode, Gambit, GambitError, Perm, Records};
 
 /// Capabilities the boring/btls executor can satisfy today (design doc §3). Notably **not**
-/// `session_id_inject` or `raw_clienthello` — those are uTLS-now / spark-P4, so a gambit requiring
-/// them is declined here and the caller falls back to its best portable gambit.
-pub const BORING_CAPABILITIES: &[Capability] =
-    &[Capability::Ech, Capability::Alps, Capability::PqKem];
+/// `raw_clienthello` — that is uTLS-now / spark-P4, so a gambit requiring it is declined here and the
+/// caller falls back to its best portable gambit.
+pub const BORING_CAPABILITIES: &[Capability] = &[
+    Capability::Ech,
+    Capability::Alps,
+    Capability::PqKem,
+    Capability::SessionIdInject,
+];
 
 /// Resolved boring connector decisions. Defaults are the byte-exact **Chrome-137 anchor**, so an
 /// empty/None genome reproduces today's hardcoded handshake (the live-gate baseline).
@@ -40,6 +47,13 @@ pub struct Profile {
     pub alps: bool,
     /// `record_size_limit` extension value; `None` = don't send it (the anchor default).
     pub record_size_limit: Option<u16>,
+    /// Explicit extension order by id (gambit `extension_order: Explicit`). `None` ⇒ boring's own
+    /// (seed-uncontrolled) permute, per `permute_extensions`.
+    pub extension_order: Option<Vec<u16>>,
+    /// Explicit cipher order by id (gambit `cipher_order: Explicit`). `None` ⇒ the pinned Chrome list.
+    pub cipher_order: Option<Vec<u16>>,
+    /// Injected `legacy_session_id` (gambit `session_id: Inject`). `None` ⇒ boring default.
+    pub session_id: Option<[u8; 32]>,
 }
 
 impl Default for Profile {
@@ -51,6 +65,9 @@ impl Default for Profile {
             ech_grease: true,
             alps: true,
             record_size_limit: None,
+            extension_order: None,
+            cipher_order: None,
+            session_id: None,
         }
     }
 }
@@ -102,32 +119,27 @@ impl Profile {
                 p.permute_extensions = true;
                 un.push("extension_order seed approximated (boring: permute on/off only)");
             }
-            Some(Perm::Explicit(_)) => un
-                .push("extension_order.explicit ignored (needs raw_clienthello / P4 byte-builder)"),
+            Some(Perm::Explicit(ids)) => p.extension_order = Some(ids.clone()),
         }
         match &ch.cipher_order {
             None => {}
             Some(Perm::PermuteSeed(_)) => {
                 un.push("cipher_order.permute ignored (boring has no cipher permutation)")
             }
-            Some(Perm::Explicit(_)) => {
-                un.push("cipher_order.explicit ignored (needs raw_clienthello / P4 byte-builder)")
-            }
+            Some(Perm::Explicit(ids)) => p.cipher_order = Some(ids.clone()),
         }
         if ch.padding_target.is_some() {
             un.push("padding_target ignored (no boring2 4.15 API; needs P4 byte-builder)");
         }
-        // session_id: Random/Resumption are the boring baseline; Inject is capability-gated out
-        // before resolve(), but flag it here too in case an unsigned/local profile sets it.
-        if matches!(ch.session_id, Some(crate::gambit::SessionId::Inject(_))) {
-            un.push("session_id.inject ignored (needs session_id_inject capability)");
+        if let Some(crate::gambit::SessionId::Inject(hex)) = &ch.session_id {
+            match decode_hex_32(hex) {
+                Some(id) => p.session_id = Some(id),
+                None => un.push("session_id.inject ignored (must be 64 hex chars)"),
+            }
         }
 
         if let Some(limit) = rec.size_limit {
             p.record_size_limit = Some(limit);
-        }
-        if !rec.split_offsets.is_empty() {
-            un.push("records.split_offsets ignored (no boring record-split API)");
         }
 
         Resolved {
@@ -138,12 +150,24 @@ impl Profile {
 
     /// Resolve a **signed-and-verified** gambit onto boring, first gating its `requires` against
     /// [`BORING_CAPABILITIES`]. Returns `Err` (declines the gambit) if it needs a capability boring
-    /// lacks (`session_id_inject` / `raw_clienthello`); the caller then falls back to its best
-    /// portable gambit.
+    /// lacks (`raw_clienthello`); the caller then falls back to its best portable gambit. (Note
+    /// `session_id_inject` is now realized, so it no longer declines a gambit.)
     pub fn for_boring(g: &Gambit) -> Result<Resolved, GambitError> {
         g.check_supported(BORING_CAPABILITIES)?;
         Ok(Self::resolve(&g.clienthello, &g.records))
     }
+}
+
+/// Decode exactly 32 bytes of hex (64 chars), or `None`. (`legacy_session_id` is 32 bytes.)
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -181,23 +205,27 @@ mod tests {
     #[test]
     fn flags_the_unrealizable_knobs_without_dropping_them_silently() {
         let ch = ClientHello {
-            cipher_order: Some(Perm::Explicit(vec![0x1301, 0x1302])),
+            cipher_order: Some(Perm::PermuteSeed(3)),
             padding_target: Some(700),
             session_id: Some(SessionId::Inject("ab".into())),
             grease_seed: Some(42),
             ..Default::default()
         };
-        let rec = Records {
-            split_offsets: vec![5, 10],
-            ..Default::default()
-        };
-        let r = Profile::resolve(&ch, &rec);
+        let r = Profile::resolve(&ch, &Records::default());
         // Expressible defaults still hold...
         assert!(r.profile.grease);
         // ...and every unrealizable knob is surfaced.
-        assert_eq!(r.unrealizable.len(), 5);
+        assert_eq!(r.unrealizable.len(), 4);
+        assert!(r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("cipher_order.permute")));
         assert!(r.unrealizable.iter().any(|m| m.contains("padding_target")));
-        assert!(r.unrealizable.iter().any(|m| m.contains("split_offsets")));
+        assert!(r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("session_id.inject")));
+        assert!(r.unrealizable.iter().any(|m| m.contains("grease seed")));
     }
 
     #[test]
@@ -216,6 +244,74 @@ mod tests {
             Profile::for_boring(&g),
             Err(GambitError::Unsupported(m)) if m == vec![Capability::RawClienthello]
         ));
+    }
+
+    #[test]
+    fn realizes_explicit_orders_and_session_id() {
+        use crate::gambit::{Perm, SessionId};
+        let ch = ClientHello {
+            extension_order: Some(Perm::Explicit(vec![0x0000, 0x0017, 0x002b])),
+            cipher_order: Some(Perm::Explicit(vec![0x1301, 0x1302])),
+            session_id: Some(SessionId::Inject(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            )),
+            ..Default::default()
+        };
+        let r = Profile::resolve(&ch, &Records::default());
+        assert_eq!(
+            r.profile.extension_order.as_deref(),
+            Some(&[0x0000u16, 0x0017, 0x002b][..])
+        );
+        assert_eq!(
+            r.profile.cipher_order.as_deref(),
+            Some(&[0x1301u16, 0x1302][..])
+        );
+        assert_eq!(r.profile.session_id.unwrap().len(), 32);
+        assert!(!r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("extension_order.explicit")));
+        assert!(!r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("session_id.inject")));
+    }
+
+    #[test]
+    fn permute_seed_stays_approximated() {
+        use crate::gambit::Perm;
+        let ch = ClientHello {
+            extension_order: Some(Perm::PermuteSeed(7)),
+            ..Default::default()
+        };
+        let r = Profile::resolve(&ch, &Records::default());
+        assert!(r.profile.extension_order.is_none());
+        assert!(r.profile.permute_extensions);
+        assert!(r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("extension_order seed approximated")));
+    }
+
+    #[test]
+    fn boring_now_advertises_session_id_inject() {
+        assert!(BORING_CAPABILITIES.contains(&Capability::SessionIdInject));
+        assert!(!BORING_CAPABILITIES.contains(&Capability::RawClienthello));
+    }
+
+    #[test]
+    fn inject_with_a_bad_hex_pin_is_flagged_not_realized() {
+        use crate::gambit::SessionId;
+        let ch = ClientHello {
+            session_id: Some(SessionId::Inject("xyz".into())),
+            ..Default::default()
+        };
+        let r = Profile::resolve(&ch, &Records::default());
+        assert!(r.profile.session_id.is_none());
+        assert!(r
+            .unrealizable
+            .iter()
+            .any(|m| m.contains("session_id.inject")));
     }
 
     #[test]
