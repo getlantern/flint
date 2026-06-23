@@ -78,6 +78,7 @@ fn ssl(e: boring2::error::ErrorStack, what: &str) -> io::Error {
 }
 
 /// TLS-connect over an established byte stream with a Chrome ClientHello, using `sni` for SNI.
+/// Passing an empty `sni` intentionally omits the SNI extension.
 ///
 /// `profile` carries the gambit-resolved on/off knobs (ADR 0006 P2): GREASE, extension permutation,
 /// the PQ supported-group, `record_size_limit`, ECH grease, and ALPS. The cipher/sigalg lists, cert
@@ -92,7 +93,14 @@ pub async fn connect<S>(stream: S, sni: &str, profile: &Profile) -> io::Result<S
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    tokio_boring2::connect(configure(profile)?, sni, stream)
+    let mut config = configure(profile)?;
+    let domain = if sni.is_empty() {
+        config.set_use_server_name_indication(false);
+        "nosni.invalid"
+    } else {
+        sni
+    };
+    tokio_boring2::connect(config, domain, stream)
         .await
         .map_err(|e| io::Error::other(format!("flint-tls handshake: {e}")))
 }

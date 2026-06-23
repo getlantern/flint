@@ -1,0 +1,17 @@
+[package]
+name = "flint-kindling"
+description = "Connection-first Rust Kindling orchestration over Flint transports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-fronted = { path = "../flint-fronted" }
+flint-transport = { path = "../flint-transport" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+flate2 = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "time"] }

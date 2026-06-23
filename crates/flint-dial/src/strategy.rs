@@ -39,14 +39,15 @@ impl TlsEngine {
 ///
 /// The `endpoint` axis from the design (raw-IP / CDN-edge-front / hostname) is captured by
 /// [`target`](Self::target) (the TCP endpoint to open — a raw IP or a CDN edge IP) paired with
-/// [`sni`](Self::sni) (the name presented in the ClientHello — the real host, or an innocuous
-/// high-collateral name for fronting). Name resolution for a hostname endpoint is the caller's job
-/// (this is the layer that *bootstraps* DNS, so the pool is curated around raw-IP / CDN-edge forms).
+/// [`sni`](Self::sni) (the name presented in the ClientHello — the real host, an innocuous
+/// high-collateral name for fronting, or an empty string when the transport intentionally omits SNI).
+/// Name resolution for a hostname endpoint is the caller's job (this is the layer that *bootstraps*
+/// DNS, so the pool is curated around raw-IP / CDN-edge forms).
 #[derive(Debug, Clone)]
 pub struct BootstrapStrategy {
     /// The TCP endpoint to connect to (a raw resolver IP, or a CDN/cloud edge IP).
     pub target: SocketAddr,
-    /// The SNI to present in the ClientHello (the real host, or a fronting name).
+    /// The SNI to present in the ClientHello (the real host, a fronting name, or empty to omit SNI).
     pub sni: String,
     /// The TLS engine + ClientHello profile.
     pub engine: TlsEngine,

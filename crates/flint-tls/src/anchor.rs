@@ -102,4 +102,13 @@ mod tests {
              validate against real Chrome, then update ANCHOR_JA4"
         );
     }
+
+    #[tokio::test]
+    async fn empty_sni_omits_server_name_extension() {
+        let ch = capture_client_hello(&Profile::default(), "")
+            .await
+            .expect("capture ClientHello");
+        let summary = parse_client_hello(&ch).expect("captured bytes parse as a ClientHello");
+        assert!(!summary.sni, "empty sni should omit the SNI extension");
+    }
 }

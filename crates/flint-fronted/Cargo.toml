@@ -1,0 +1,32 @@
+[package]
+name = "flint-fronted"
+description = "Connection-first domain-fronting primitives for Lantern fronted.yaml configs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+boring = ["flint-dial/boring", "flint-dns/boring"]
+
+[dependencies]
+flint-dial = { path = "../flint-dial" }
+flint-dns = { path = "../flint-dns" }
+flint-shaping = { path = "../flint-shaping" }
+flint-transport = { path = "../flint-transport" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }

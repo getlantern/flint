@@ -6,6 +6,9 @@ members = [
     "crates/flint-tls",
     "crates/flint-dial",
     "crates/flint-dns",
+    "crates/flint-transport",
+    "crates/flint-fronted",
+    "crates/flint-kindling",
 ]
 
 [workspace.package]
@@ -27,6 +30,8 @@ thiserror = "2"
 tracing = "0.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+flate2 = "1"
 # Concurrency combinators (FuturesUnordered) for the dial race. Locked stack: futures 0.3.
 futures = "0.3"
 # DoH over HTTP/2 (sans-hyper, matches spark): the H2 layer lives inside TLS so its fingerprint is
