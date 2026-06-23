@@ -39,8 +39,12 @@ pub enum CertVerification {
     /// Verify the peer certificate against the supplied PEM roots, or system roots when empty, and
     /// verify the certificate for `hostname`. The hostname is the identity being verified and is
     /// intentionally separate from ClientHello SNI.
+    ///
+    /// `roots_pem` is an `Arc<[String]>` so one root set is shared cheaply across the many per-front /
+    /// per-address strategies a fronting dial fans out into (clone is a refcount bump, not a deep copy
+    /// of the PEM data).
     Roots {
-        roots_pem: Vec<String>,
+        roots_pem: std::sync::Arc<[String]>,
         hostname: String,
     },
 }

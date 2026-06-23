@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn with_verification_attaches_certificate_policy() {
         let verification = CertVerification::Roots {
-            roots_pem: vec!["pem".into()],
+            roots_pem: std::sync::Arc::from(["pem".to_string()]),
             hostname: "edge.example".into(),
         };
         let s = BootstrapStrategy::boring_chrome(addr(), "front.example")

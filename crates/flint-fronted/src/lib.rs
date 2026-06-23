@@ -831,7 +831,7 @@ impl FrontResolver for FlintDnsResolver {
 #[derive(Debug, Clone)]
 pub struct FrontPool {
     providers: BTreeMap<String, Provider>,
-    trusted_roots: Vec<String>,
+    trusted_roots: std::sync::Arc<[String]>,
 }
 
 impl FrontPool {
@@ -841,7 +841,7 @@ impl FrontPool {
             .iter()
             .map(|(id, p)| (id.clone(), p.expanded(country_code)))
             .collect();
-        let trusted_roots = config
+        let trusted_roots: std::sync::Arc<[String]> = config
             .trusted_cas
             .iter()
             .filter_map(|ca| non_empty_str(&ca.cert).map(ToOwned::to_owned))
@@ -1553,7 +1553,7 @@ providers:
         assert_eq!(
             fronts[0].front.verification,
             CertVerification::Roots {
-                roots_pem: vec![cfg.trusted_cas[0].cert.clone()],
+                roots_pem: std::sync::Arc::from([cfg.trusted_cas[0].cert.clone()]),
                 hostname: "verify.example.net".into(),
             }
         );
