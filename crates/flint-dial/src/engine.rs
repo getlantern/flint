@@ -5,7 +5,7 @@ use std::io;
 use flint_shaping::WirePlan;
 #[cfg(feature = "boring")]
 use flint_shaping::{RecordFragmentingStream, SegmentShapingStream};
-use flint_tls::Profile;
+use flint_tls::{CertVerification, Profile};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -30,7 +30,14 @@ where
 {
     match &strategy.engine {
         TlsEngine::BoringChrome(profile) => {
-            dial_boring(stream, &strategy.sni, profile, &strategy.wire).await
+            dial_boring(
+                stream,
+                &strategy.sni,
+                profile,
+                &strategy.wire,
+                &strategy.verification,
+            )
+            .await
         }
         TlsEngine::Rustls => {
             drop(stream);
@@ -62,11 +69,12 @@ async fn dial_boring<S>(
     sni: &str,
     profile: &Profile,
     wire: &WirePlan,
+    verification: &CertVerification,
 ) -> io::Result<BoxedTlsStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let tls = flint_tls::connect(shape(stream, wire), sni, profile).await?;
+    let tls = flint_tls::connect_with(shape(stream, wire), sni, profile, verification).await?;
     Ok(Box::new(tls))
 }
 
@@ -76,6 +84,7 @@ async fn dial_boring<S>(
     _sni: &str,
     _profile: &Profile,
     _wire: &WirePlan,
+    _verification: &CertVerification,
 ) -> io::Result<BoxedTlsStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,

@@ -30,4 +30,6 @@ tokio = { version = "1", default-features = false, features = ["io-util", "rt", 
 tracing = { workspace = true }
 
 [dev-dependencies]
+boring2 = { workspace = true, features = ["pq-experimental", "cert-compression"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-boring2 = { workspace = true }

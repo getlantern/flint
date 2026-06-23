@@ -6,10 +6,11 @@
 //! (`emulation/device/chrome.rs`); the boring2 application mirrors `wreq`'s `tls/conn/boring.rs` +
 //! `tls/ext.rs`.
 //!
-//! Certificate verification is **skipped**: a bootstrap dial authenticates its payload out of band
+//! [`connect`] skips certificate verification: a bootstrap dial authenticates its payload out of band
 //! (e.g. an Ed25519-signed config, or the carrier protocol's own auth), and TLS here is the camouflage
-//! carrier. Fingerprint freshness is covered by the JA4 drift check ([`crate::anchor`]) and the
-//! update-mimicry CI.
+//! carrier. [`connect_with`] accepts an explicit verification policy for transports, such as domain
+//! fronting, where the front certificate has to be authenticated. Fingerprint freshness is covered by
+//! the JA4 drift check ([`crate::anchor`]) and the update-mimicry CI.
 
 use std::borrow::Cow;
 use std::io;
@@ -18,10 +19,11 @@ use boring2::ssl::{
     CertCompressionAlgorithm, ConnectConfiguration, ExtensionType, SslConnector, SslCurve,
     SslMethod, SslVerifyMode,
 };
+use boring2::x509::{store::X509StoreBuilder, X509};
 use foreign_types_shared::ForeignTypeRef; // brings `as_ptr` onto boring2's `SslRef`
-use tokio_boring2::SslStream;
+use tokio_boring2::{SslStream, SslStreamBuilder};
 
-use crate::profile::Profile;
+use crate::{profile::Profile, CertVerification};
 
 /// TLS 1.2 wire version, for `SSL_SESSION_set_protocol_version` (forces boring's `kID` path so the
 /// fabricated session's id is emitted as the ClientHello `legacy_session_id`). See [`inject_session_id`].
@@ -93,16 +95,81 @@ pub async fn connect<S>(stream: S, sni: &str, profile: &Profile) -> io::Result<S
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    connect_with(stream, sni, profile, &CertVerification::None).await
+}
+
+/// TLS-connect over an established byte stream with a Chrome ClientHello and an explicit
+/// certificate verification policy.
+///
+/// In [`CertVerification::Roots`] mode, `sni` controls only the SNI extension: an empty value omits
+/// SNI, while a non-empty value is sent as the fronting SNI. The certificate chain and hostname are
+/// verified against `hostname`, even when it differs from SNI.
+pub async fn connect_with<S>(
+    stream: S,
+    sni: &str,
+    profile: &Profile,
+    verify: &CertVerification,
+) -> io::Result<SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut config = configure(profile)?;
-    let domain = if sni.is_empty() {
-        config.set_use_server_name_indication(false);
-        "nosni.invalid"
+    match verify {
+        CertVerification::None => {
+            let domain = if sni.is_empty() {
+                config.set_use_server_name_indication(false);
+                "nosni.invalid"
+            } else {
+                sni
+            };
+            tokio_boring2::connect(config, domain, stream)
+                .await
+                .map_err(|e| io::Error::other(format!("flint-tls handshake: {e}")))
+        }
+        CertVerification::Roots {
+            roots_pem,
+            hostname,
+        } => {
+            if hostname.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "flint-tls: verified connection requires a hostname",
+                ));
+            }
+            config.set_verify(SslVerifyMode::PEER);
+            config.set_verify_hostname(true);
+            config
+                .set_verify_cert_store(cert_store(roots_pem)?)
+                .map_err(|e| ssl(e, "verify-store"))?;
+            config.set_use_server_name_indication(false);
+            let mut tls = config
+                .into_ssl(hostname)
+                .map_err(|e| ssl(e, "verify-hostname"))?;
+            if !sni.is_empty() {
+                tls.set_hostname(sni).map_err(|e| ssl(e, "sni"))?;
+            }
+            SslStreamBuilder::new(tls, stream)
+                .connect()
+                .await
+                .map_err(|e| io::Error::other(format!("flint-tls handshake: {e}")))
+        }
+    }
+}
+
+fn cert_store(roots_pem: &[String]) -> io::Result<boring2::x509::store::X509Store> {
+    let mut builder = X509StoreBuilder::new().map_err(|e| ssl(e, "verify-store"))?;
+    if roots_pem.is_empty() {
+        builder
+            .set_default_paths()
+            .map_err(|e| ssl(e, "system-roots"))?;
     } else {
-        sni
-    };
-    tokio_boring2::connect(config, domain, stream)
-        .await
-        .map_err(|e| io::Error::other(format!("flint-tls handshake: {e}")))
+        for pem in roots_pem {
+            for cert in X509::stack_from_pem(pem.as_bytes()).map_err(|e| ssl(e, "roots-pem"))? {
+                builder.add_cert(cert).map_err(|e| ssl(e, "root-cert"))?;
+            }
+        }
+    }
+    Ok(builder.build())
 }
 
 /// Build the per-connection Chrome [`ConnectConfiguration`] — everything up to, but not including,

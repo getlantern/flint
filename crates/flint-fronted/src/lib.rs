@@ -5,10 +5,13 @@
 //! materializes `flint-dial::BootstrapStrategy` values. A higher-level transport can then run its
 //! own CONNECT/Upgrade/meek-style stream establishment over the returned TLS stream.
 //!
-//! The first transport shape preserves Flint's bootstrap TLS policy: the `trustedcas` and
-//! `verifyhostname` fields are parsed for Lantern config compatibility, but certificate verification is
-//! not enforced yet. Callers must rely on the inner protocol's authentication until fronted cert
-//! verification is wired through `flint-tls`.
+//! Fronted TLS strategies always verify the CDN/front certificate: `trustedcas` becomes the trust
+//! roots (empty means system roots), and `verifyhostname` selects the certificate hostname
+//! independently from SNI. Meek is deliberately standalone CDN-compatible framing over that verified
+//! Chrome TLS stream: do not layer samizdat, anytls, or any other end-to-end TLS/auth transport inside
+//! it. The CDN terminates TLS and re-originates the HTTP/2 request, so REALITY-style
+//! `legacy_session_id` authentication cannot be domain-fronted; the CDN sees meek plaintext, while
+//! certificate verification protects only against a third-party MITM impersonating the edge.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -22,7 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use flint_dial::{BootstrapStrategy, BoxedTlsStream};
+use flint_dial::{BootstrapStrategy, BoxedTlsStream, CertVerification};
 use flint_dns::{ResolverCache, TYPE_A, TYPE_AAAA};
 use flint_shaping::WirePlan;
 pub use flint_transport::{
@@ -143,7 +146,9 @@ impl Provider {
                 .map(|m| {
                     let mut out = m.clone();
                     out.sni = generate_sni(sni_cfg, &m.ip_address);
-                    out.verify_hostname = self.verify_hostname.clone();
+                    if empty_opt(out.verify_hostname.as_deref()) {
+                        out.verify_hostname = self.verify_hostname.clone();
+                    }
                     out
                 })
                 .collect(),
@@ -192,6 +197,7 @@ pub struct Front {
     pub endpoint: FrontEndpoint,
     pub sni: String,
     pub fronted_host: String,
+    pub verification: CertVerification,
 }
 
 impl Front {
@@ -200,7 +206,9 @@ impl Front {
             .iter()
             .copied()
             .map(|addr| {
-                BootstrapStrategy::boring_chrome(addr, self.sni.clone()).with_wire(wire.clone())
+                BootstrapStrategy::boring_chrome(addr, self.sni.clone())
+                    .with_wire(wire.clone())
+                    .with_verification(self.verification.clone())
             })
             .collect()
     }
@@ -823,6 +831,7 @@ impl FrontResolver for FlintDnsResolver {
 #[derive(Debug, Clone)]
 pub struct FrontPool {
     providers: BTreeMap<String, Provider>,
+    trusted_roots: Vec<String>,
 }
 
 impl FrontPool {
@@ -832,7 +841,15 @@ impl FrontPool {
             .iter()
             .map(|(id, p)| (id.clone(), p.expanded(country_code)))
             .collect();
-        Self { providers }
+        let trusted_roots = config
+            .trusted_cas
+            .iter()
+            .filter_map(|ca| non_empty_str(&ca.cert).map(ToOwned::to_owned))
+            .collect();
+        Self {
+            providers,
+            trusted_roots,
+        }
     }
 
     pub fn fronts_for_host(&self, host: &str) -> Result<Vec<Front>, Error> {
@@ -844,6 +861,14 @@ impl FrontPool {
             };
             saw_provider = true;
             for m in &provider.masquerades {
+                if m.domain.is_empty() {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        fronted_host = %fronted_host,
+                        "skipping fronted masquerade with no certificate domain"
+                    );
+                    continue;
+                }
                 let Some(endpoint) = FrontEndpoint::from_masquerade(m) else {
                     tracing::warn!(
                         provider = %provider_id,
@@ -858,6 +883,10 @@ impl FrontPool {
                     endpoint,
                     sni: m.sni.clone(),
                     fronted_host: fronted_host.clone(),
+                    verification: CertVerification::Roots {
+                        roots_pem: self.trusted_roots.clone(),
+                        hostname: verification_hostname(m, provider).to_owned(),
+                    },
                 });
             }
         }
@@ -1003,7 +1032,8 @@ fn candidates(fronts: &[MaterializedFront], wire: WirePlan) -> Vec<DialCandidate
                 let wire = wire.clone();
                 move |addr| {
                     let strategy = BootstrapStrategy::boring_chrome(addr, front.sni.clone())
-                        .with_wire(wire.clone());
+                        .with_wire(wire.clone())
+                        .with_verification(front.verification.clone());
                     DialCandidate {
                         front: front.clone(),
                         addr,
@@ -1061,6 +1091,24 @@ pub fn generate_sni(config: Option<&SNIConfig>, ip_address: &str) -> String {
     config.arbitrary_snis[idx].clone()
 }
 
+fn verification_hostname<'a>(masquerade: &'a Masquerade, provider: &'a Provider) -> &'a str {
+    non_empty(masquerade.verify_hostname.as_deref())
+        .or_else(|| non_empty(provider.verify_hostname.as_deref()))
+        .unwrap_or(&masquerade.domain)
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.and_then(non_empty_str)
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn empty_opt(value: Option<&str>) -> bool {
+    non_empty(value).is_none()
+}
+
 fn strip_port(host: &str) -> &str {
     host.rsplit_once(':')
         .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
@@ -1097,11 +1145,37 @@ fn parse_endpoint(s: &str) -> Option<FrontEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "boring")]
+    use boring2::{
+        asn1::Asn1Time,
+        bn::BigNum,
+        hash::MessageDigest,
+        nid::Nid,
+        pkey::{PKey, Private},
+        rsa::Rsa,
+        ssl::{NameType, SslAcceptor, SslMethod},
+        x509::{
+            extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+            X509NameBuilder, X509,
+        },
+    };
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use http::Response;
     use std::io::Write;
+    #[cfg(feature = "boring")]
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "boring")]
+    static SERIAL: AtomicU32 = AtomicU32::new(1);
+
+    #[cfg(feature = "boring")]
+    struct TestCa {
+        cert: X509,
+        key: PKey<Private>,
+        pem: String,
+    }
 
     struct StaticResolver(Vec<IpAddr>);
 
@@ -1143,6 +1217,95 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "boring")]
+    fn test_ca() -> TestCa {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let name = x509_name("Test Root");
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        builder.set_pubkey(&key).unwrap();
+        set_serial(&mut builder);
+        builder
+            .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        builder
+            .append_extension(KeyUsage::new().key_cert_sign().crl_sign().build().unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+        let pem = String::from_utf8(cert.to_pem().unwrap()).unwrap();
+        TestCa { cert, key, pem }
+    }
+
+    #[cfg(feature = "boring")]
+    fn server_acceptor(ca: &TestCa, hostname: &str) -> SslAcceptor {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let name = x509_name(hostname);
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(ca.cert.subject_name()).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        builder.set_pubkey(&key).unwrap();
+        set_serial(&mut builder);
+        builder
+            .append_extension(BasicConstraints::new().critical().build().unwrap())
+            .unwrap();
+        builder
+            .append_extension(
+                KeyUsage::new()
+                    .digital_signature()
+                    .key_encipherment()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        builder
+            .append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap())
+            .unwrap();
+        let san = SubjectAlternativeName::new()
+            .dns(hostname)
+            .build(&builder.x509v3_context(Some(&ca.cert), None))
+            .unwrap();
+        builder.append_extension(san).unwrap();
+        builder.sign(&ca.key, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        acceptor.set_certificate(&cert).unwrap();
+        acceptor.check_private_key().unwrap();
+        acceptor.build()
+    }
+
+    #[cfg(feature = "boring")]
+    fn x509_name(common_name: &str) -> boring2::x509::X509Name {
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, common_name)
+            .unwrap();
+        name.build()
+    }
+
+    #[cfg(feature = "boring")]
+    fn set_serial(builder: &mut boring2::x509::X509Builder) {
+        let n = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let serial = BigNum::from_u32(n).unwrap().to_asn1_integer().unwrap();
+        builder.set_serial_number(&serial).unwrap();
+    }
+
     fn config_yaml() -> &'static [u8] {
         br#"
 trustedcas:
@@ -1178,6 +1341,43 @@ providers:
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(config_yaml()).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[cfg(feature = "boring")]
+    fn verified_config(ca_pem: String, sni: &str) -> Config {
+        Config {
+            trusted_cas: vec![CA {
+                common_name: "Test Root".into(),
+                cert: ca_pem,
+            }],
+            providers: BTreeMap::from([(
+                "akamai".into(),
+                Provider {
+                    host_aliases: BTreeMap::from([(
+                        "api.example.com".into(),
+                        "origin.example.net".into(),
+                    )]),
+                    fronting_snis: if sni.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        BTreeMap::from([(
+                            "default".into(),
+                            SNIConfig {
+                                use_arbitrary_snis: true,
+                                arbitrary_snis: vec![sni.into()],
+                            },
+                        )])
+                    },
+                    masquerades: vec![Masquerade {
+                        domain: "edge.test".into(),
+                        ip_address: "203.0.113.10".into(),
+                        sni: String::new(),
+                        verify_hostname: None,
+                    }],
+                    ..Default::default()
+                },
+            )]),
+        }
     }
 
     #[test]
@@ -1337,6 +1537,61 @@ providers:
         );
         assert_eq!(fronts[0].front.fronted_host, "api.dsa.example.net");
         assert_eq!(fronts[0].front.sni, "");
+        assert_eq!(
+            fronts[0].front.verification,
+            CertVerification::Roots {
+                roots_pem: vec![cfg.trusted_cas[0].cert.clone()],
+                hostname: "verify.example.net".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn front_verification_prefers_masquerade_then_provider_then_domain() {
+        let cfg = parse_config_yaml(
+            br#"
+providers:
+  akamai:
+    hostaliases:
+      api.example.com: api.dsa.example.net
+    verifyhostname: provider.example.net
+    masquerades:
+      - domain: edge-one.example.net
+        ipaddress: "203.0.113.10"
+        verifyhostname: mask.example.net
+      - domain: edge-two.example.net
+        ipaddress: "203.0.113.11"
+      - domain: edge-three.example.net
+        ipaddress: "203.0.113.12"
+        verifyhostname: ""
+  cloudfront:
+    hostaliases:
+      api.example.com: api.dsa.example.net
+    masquerades:
+      - domain: edge-four.example.net
+        ipaddress: "203.0.113.13"
+"#,
+        )
+        .unwrap();
+        let pool = FrontPool::new(&cfg, "");
+        let fronts = pool.fronts_for_host("api.example.com").unwrap();
+
+        let hosts: Vec<_> = fronts
+            .iter()
+            .filter_map(|front| match &front.verification {
+                CertVerification::Roots { hostname, .. } => Some(hostname.as_str()),
+                CertVerification::None => None,
+            })
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                "mask.example.net",
+                "provider.example.net",
+                "provider.example.net",
+                "edge-four.example.net",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1457,6 +1712,154 @@ providers:
         assert_eq!(conn.fronted_host(), "api.dsa.example.net");
     }
 
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn fronted_tls_verifies_front_certificate_with_empty_sni() {
+        let ca = test_ca();
+        let cfg = verified_config(ca.pem.clone(), "");
+        let resolver = StaticResolver(vec![]);
+        let dialer = FrontedTlsDialer::new(&cfg, "", resolver).with_dial_options(DialOptions {
+            window: 1,
+            attempt_timeout: None,
+            ..Default::default()
+        });
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "edge.test"));
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
+        let sni_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(sni_tx)));
+
+        let conn = dialer
+            .connect_fronted_with("api.example.com", move |strategy| {
+                let acceptor = acceptor.clone();
+                let sni_tx = sni_tx.lock().unwrap().take();
+                async move {
+                    let (client, server) = tokio::io::duplex(32 * 1024);
+                    tokio::spawn(async move {
+                        let mut tls = tokio_boring2::accept(&acceptor, server).await.unwrap();
+                        let seen = tls
+                            .ssl()
+                            .servername(NameType::HOST_NAME)
+                            .map(ToOwned::to_owned);
+                        if let Some(tx) = sni_tx {
+                            let _ = tx.send(seen);
+                        }
+                        tls.write_all(b"ok").await.unwrap();
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+            .unwrap();
+
+        let mut stream = conn.stream;
+        let mut out = [0; 2];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ok");
+        assert_eq!(sni_rx.await.unwrap(), None);
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn fronted_tls_rejects_front_certificate_signed_by_untrusted_root() {
+        let trusted = test_ca();
+        let untrusted = test_ca();
+        let cfg = verified_config(trusted.pem.clone(), "");
+        let resolver = StaticResolver(vec![]);
+        let dialer = FrontedTlsDialer::new(&cfg, "", resolver).with_dial_options(DialOptions {
+            window: 1,
+            attempt_timeout: None,
+            ..Default::default()
+        });
+        let acceptor = std::sync::Arc::new(server_acceptor(&untrusted, "edge.test"));
+
+        let err = match dialer
+            .connect_fronted_with("api.example.com", move |strategy| {
+                let acceptor = acceptor.clone();
+                async move {
+                    let (client, server) = tokio::io::duplex(32 * 1024);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring2::accept(&acceptor, server).await;
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+        {
+            Ok(_) => panic!("expected certificate verification failure"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::DialFailed { tried: 1, .. }));
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn fronted_meek_round_trips_over_verified_front() {
+        let ca = test_ca();
+        let cfg = verified_config(ca.pem.clone(), "cover.example");
+        let resolver = StaticResolver(vec![]);
+        let dialer = FrontedMeekDialer::new(&cfg, "us", resolver)
+            .with_dial_options(DialOptions {
+                window: 1,
+                attempt_timeout: None,
+                ..Default::default()
+            })
+            .with_meek_options(MeekOptions {
+                path: "/kindling".into(),
+                ..Default::default()
+            });
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "edge.test"));
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+
+        let mut conn = dialer
+            .connect_fronted_with("api.example.com", move |strategy| {
+                let acceptor = acceptor.clone();
+                let seen_tx = seen_tx.lock().unwrap().take();
+                async move {
+                    let (client, server) = tokio::io::duplex(128 * 1024);
+                    tokio::spawn(async move {
+                        let tls = tokio_boring2::accept(&acceptor, server).await.unwrap();
+                        let seen = tls
+                            .ssl()
+                            .servername(NameType::HOST_NAME)
+                            .map(ToOwned::to_owned);
+                        if let Some(tx) = seen_tx {
+                            let _ = tx.send(seen);
+                        }
+                        let mut h2 = h2::server::handshake(tls).await.unwrap();
+                        let accepted = h2.accept().await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let (request, mut respond) = accepted;
+                            assert_eq!(request.method(), Method::POST);
+                            assert_eq!(request.uri().path(), "/kindling");
+                            assert_eq!(request.headers()[http::header::HOST], "origin.example.net");
+
+                            let mut send = respond
+                                .send_response(
+                                    Response::builder().status(200).body(()).unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                            let mut body = request.into_body();
+                            let chunk = body.data().await.unwrap().unwrap();
+                            assert_eq!(&chunk[..], b"ping");
+                            send.send_data(Bytes::from_static(b"pong"), true).unwrap();
+                        });
+                        while h2.accept().await.is_some() {}
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+            .unwrap();
+
+        conn.stream.write_all(b"ping").await.unwrap();
+        let mut out = [0; 4];
+        conn.stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"pong");
+        assert_eq!(seen_rx.await.unwrap(), Some("cover.example".into()));
+    }
+
     #[tokio::test]
     async fn dial_with_reports_empty_materialized_fronts() {
         let err = race_materialized_with::<_, _, ()>(
@@ -1508,6 +1911,7 @@ providers:
                 endpoint: FrontEndpoint::Ip("203.0.113.10:443".parse().unwrap()),
                 sni: "cover.example".into(),
                 fronted_host: "origin.example.net".into(),
+                verification: CertVerification::None,
             },
             addr: "203.0.113.10:443".parse().unwrap(),
             candidate_index: 0,
@@ -1557,6 +1961,7 @@ providers:
                 endpoint: FrontEndpoint::Ip("203.0.113.10:443".parse().unwrap()),
                 sni: String::new(),
                 fronted_host: "origin.example.net".into(),
+                verification: CertVerification::None,
             },
             addr: "203.0.113.10:443".parse().unwrap(),
             candidate_index: 0,
@@ -1669,6 +2074,7 @@ providers:
             endpoint: FrontEndpoint::Ip("203.0.113.10:443".parse().unwrap()),
             sni: "cover.example".into(),
             fronted_host: "origin.cdn.example".into(),
+            verification: CertVerification::None,
         };
         let strategies =
             front.strategies(&["203.0.113.10:443".parse().unwrap()], WirePlan::default());

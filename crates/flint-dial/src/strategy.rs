@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use flint_shaping::WirePlan;
-use flint_tls::Profile;
+use flint_tls::{CertVerification, Profile};
 
 /// Which TLS engine (and ClientHello shape) a strategy dials with.
 ///
@@ -41,6 +41,9 @@ impl TlsEngine {
 /// [`target`](Self::target) (the TCP endpoint to open — a raw IP or a CDN edge IP) paired with
 /// [`sni`](Self::sni) (the name presented in the ClientHello — the real host, an innocuous
 /// high-collateral name for fronting, or an empty string when the transport intentionally omits SNI).
+/// [`verification`](Self::verification) is the independent certificate identity check: fronted
+/// strategies can verify the CDN edge certificate for a hostname while still sending a different SNI,
+/// or no SNI at all.
 /// Name resolution for a hostname endpoint is the caller's job (this is the layer that *bootstraps*
 /// DNS, so the pool is curated around raw-IP / CDN-edge forms).
 #[derive(Debug, Clone)]
@@ -54,6 +57,8 @@ pub struct BootstrapStrategy {
     /// Opening-handshake wire shaping (Layer B `record_fragment` + Layer C `tcp_split`). A default
     /// plan is a no-op passthrough.
     pub wire: WirePlan,
+    /// Certificate verification policy, independent of ClientHello SNI.
+    pub verification: CertVerification,
 }
 
 impl BootstrapStrategy {
@@ -66,12 +71,19 @@ impl BootstrapStrategy {
             sni: sni.into(),
             engine: TlsEngine::BoringChrome(Profile::default()),
             wire: WirePlan::default(),
+            verification: CertVerification::None,
         }
     }
 
     /// Set the opening-handshake wire plan (builder style).
     pub fn with_wire(mut self, wire: WirePlan) -> Self {
         self.wire = wire;
+        self
+    }
+
+    /// Set the certificate verification policy (builder style).
+    pub fn with_verification(mut self, verification: CertVerification) -> Self {
+        self.verification = verification;
         self
     }
 }
@@ -91,6 +103,7 @@ mod tests {
         assert_eq!(s.sni, "cloudflare-dns.com");
         assert_eq!(s.engine.kind(), "boring-chrome");
         assert!(s.wire.is_noop());
+        assert!(matches!(s.verification, CertVerification::None));
         assert!(matches!(s.engine, TlsEngine::BoringChrome(_)));
     }
 
@@ -115,5 +128,16 @@ mod tests {
             TlsEngine::BoringChrome(Profile::default()).kind(),
             "boring-chrome"
         );
+    }
+
+    #[test]
+    fn with_verification_attaches_certificate_policy() {
+        let verification = CertVerification::Roots {
+            roots_pem: vec!["pem".into()],
+            hostname: "edge.example".into(),
+        };
+        let s = BootstrapStrategy::boring_chrome(addr(), "front.example")
+            .with_verification(verification.clone());
+        assert_eq!(s.verification, verification);
     }
 }
