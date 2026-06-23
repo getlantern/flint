@@ -861,11 +861,12 @@ impl FrontPool {
             };
             saw_provider = true;
             for m in &provider.masquerades {
-                if m.domain.is_empty() {
+                let verify_hostname = verification_hostname(m, provider);
+                if verify_hostname.is_empty() {
                     tracing::warn!(
                         provider = %provider_id,
                         fronted_host = %fronted_host,
-                        "skipping fronted masquerade with no certificate domain"
+                        "skipping fronted masquerade with no certificate verification hostname"
                     );
                     continue;
                 }
@@ -885,7 +886,7 @@ impl FrontPool {
                     fronted_host: fronted_host.clone(),
                     verification: CertVerification::Roots {
                         roots_pem: self.trusted_roots.clone(),
-                        hostname: verification_hostname(m, provider).to_owned(),
+                        hostname: verify_hostname.to_owned(),
                     },
                 });
             }
@@ -1624,6 +1625,39 @@ providers:
     }
 
     #[test]
+    fn fronts_for_host_keeps_ip_only_masquerade_with_verify_hostname() {
+        // An IP-only masquerade (no domain) is still dialable and verifiable when a
+        // provider/masquerade `verifyhostname` supplies the certificate identity — it must not be
+        // dropped by the empty-domain guard.
+        let cfg = parse_config_yaml(
+            br#"
+providers:
+  akamai:
+    hostaliases:
+      api.example.com: api.dsa.example.net
+    verifyhostname: provider.example.net
+    masquerades:
+      - domain: ""
+        ipaddress: "203.0.113.10"
+"#,
+        )
+        .unwrap();
+        let pool = FrontPool::new(&cfg, "");
+
+        let fronts = pool.fronts_for_host("api.example.com").unwrap();
+
+        assert_eq!(fronts.len(), 1);
+        assert_eq!(
+            fronts[0].endpoint,
+            FrontEndpoint::Ip("203.0.113.10:443".parse().unwrap())
+        );
+        assert!(matches!(
+            &fronts[0].verification,
+            CertVerification::Roots { hostname, .. } if hostname == "provider.example.net"
+        ));
+    }
+
+    #[test]
     fn fronts_for_host_skips_malformed_masquerades() {
         let cfg = parse_config_yaml(
             br#"
@@ -1785,6 +1819,42 @@ providers:
             .await
         {
             Ok(_) => panic!("expected certificate verification failure"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::DialFailed { tried: 1, .. }));
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn fronted_tls_rejects_front_certificate_with_mismatched_hostname() {
+        let ca = test_ca();
+        let cfg = verified_config(ca.pem.clone(), "");
+        let resolver = StaticResolver(vec![]);
+        let dialer = FrontedTlsDialer::new(&cfg, "", resolver).with_dial_options(DialOptions {
+            window: 1,
+            attempt_timeout: None,
+            ..Default::default()
+        });
+        // Chains to the *trusted* CA, but the leaf is issued for the wrong name. The config verifies
+        // against `edge.test` (the masquerade domain), so the hostname check must reject it — this
+        // proves verify_hostname is enforced against the leaf, not only the chain.
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "wrong-host.test"));
+
+        let err = match dialer
+            .connect_fronted_with("api.example.com", move |strategy| {
+                let acceptor = acceptor.clone();
+                async move {
+                    let (client, server) = tokio::io::duplex(32 * 1024);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring2::accept(&acceptor, server).await;
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+        {
+            Ok(_) => panic!("expected hostname verification failure"),
             Err(err) => err,
         };
 
