@@ -155,11 +155,13 @@ mod tests {
     use flate2::Compression;
     use std::io;
     use std::io::Write;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct MemoryTransport {
         name: &'static str,
         fail: bool,
+        delay: Option<Duration>,
     }
 
     #[async_trait]
@@ -171,6 +173,9 @@ mod tests {
         }
 
         async fn connect(&self, _host: &str) -> io::Result<Self::Stream> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.fail {
                 return Err(io::Error::other("blocked"));
             }
@@ -213,10 +218,12 @@ providers:
             .with_transport(MemoryTransport {
                 name: "blocked",
                 fail: true,
+                delay: None,
             })
             .with_transport(MemoryTransport {
                 name: "memory",
                 fail: false,
+                delay: None,
             });
 
         assert_eq!(kindling.transport_count(), 2);
@@ -225,6 +232,44 @@ providers:
         assert_eq!(conn.index, 1);
         assert_eq!(conn.transport, "memory");
 
+        conn.stream.write_all(b"hello").await.unwrap();
+        let mut out = [0; 5];
+        conn.stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"world");
+    }
+
+    #[tokio::test]
+    async fn kindling_succeeds_if_one_transport_connects_after_others_fail() {
+        let kindling = Kindling::new()
+            .with_race_options(RaceOptions {
+                window: 4,
+                attempt_timeout: Some(Duration::from_secs(1)),
+            })
+            .with_transport(MemoryTransport {
+                name: "blocked-1",
+                fail: true,
+                delay: None,
+            })
+            .with_transport(MemoryTransport {
+                name: "blocked-2",
+                fail: true,
+                delay: None,
+            })
+            .with_transport(MemoryTransport {
+                name: "slow-success",
+                fail: false,
+                delay: Some(Duration::from_millis(25)),
+            })
+            .with_transport(MemoryTransport {
+                name: "blocked-3",
+                fail: true,
+                delay: None,
+            });
+
+        let mut conn = kindling.connect("api.example.com").await.unwrap();
+
+        assert_eq!(conn.index, 2);
+        assert_eq!(conn.transport, "slow-success");
         conn.stream.write_all(b"hello").await.unwrap();
         let mut out = [0; 5];
         conn.stream.read_exact(&mut out).await.unwrap();
