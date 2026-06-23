@@ -20,6 +20,9 @@ use crate::profile::Profile;
 /// The pinned JA4 of the `chrome-137` anchor — the fingerprint [`Profile::default`] must emit. CI
 /// fails if the boring ClientHello drifts from it (see the test below). Established by capture; a
 /// human validates it against a real Chrome out of band (ADR 0006 §4).
+/// This anchor is intentionally for the ordinary SNI-bearing Chrome path. Callers that pass an empty
+/// SNI use a distinct fronting fingerprint; the no-SNI behavior is covered by a structural test below,
+/// not this JA4 constant.
 ///
 /// The `t13d1516h2_8daaf6152771` prefix (TLS 1.3, SNI, 15 ciphers, 16 extensions, h2 ALPN, and the
 /// canonical Chrome cipher hash) matches the well-known Chrome JA4 — evidence the profile

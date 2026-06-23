@@ -4,6 +4,11 @@
 //! expands country-specific SNI choices, resolves host-based fronts through `flint-dns`, and
 //! materializes `flint-dial::BootstrapStrategy` values. A higher-level transport can then run its
 //! own CONNECT/Upgrade/meek-style stream establishment over the returned TLS stream.
+//!
+//! The first transport shape preserves Flint's bootstrap TLS policy: the `trustedcas` and
+//! `verifyhostname` fields are parsed for Lantern config compatibility, but certificate verification is
+//! not enforced yet. Callers must rely on the inner protocol's authentication until fronted cert
+//! verification is wired through `flint-tls`.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -11,6 +16,7 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -28,6 +34,8 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
+
+const MAX_H2_WRITE_CHUNK: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -100,7 +108,8 @@ impl Provider {
         }
         self.passthrough_patterns.iter().find_map(|pattern| {
             if let Some(suffix) = pattern.strip_prefix("*.") {
-                host.ends_with(&format!(".{suffix}"))
+                host.strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
                     .then_some(host.clone())
             } else {
                 (pattern == &host).then_some(host.clone())
@@ -171,13 +180,8 @@ pub enum FrontEndpoint {
 }
 
 impl FrontEndpoint {
-    pub fn from_masquerade(m: &Masquerade) -> Self {
-        parse_endpoint(&m.ip_address)
-            .or_else(|| parse_endpoint(&m.domain))
-            .unwrap_or_else(|| FrontEndpoint::Host {
-                name: m.domain.clone(),
-                port: 443,
-            })
+    pub fn from_masquerade(m: &Masquerade) -> Option<Self> {
+        parse_endpoint(&m.ip_address).or_else(|| parse_endpoint(&m.domain))
     }
 }
 
@@ -277,6 +281,7 @@ pub struct MeekStream {
     send: h2::SendStream<Bytes>,
     read_buf: Option<Bytes>,
     write_closed: bool,
+    driver_state: DriverState,
     _driver: DriverGuard,
 }
 
@@ -552,11 +557,25 @@ impl AsyncRead for MeekStream {
         cx: &mut Context<'_>,
         dst: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if dst.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
-            if let Some(buf) = &mut self.read_buf {
-                let n = buf.remaining().min(dst.remaining());
-                dst.put_slice(&buf.copy_to_bytes(n));
-                if !buf.has_remaining() {
+            if self.read_buf.is_some() {
+                let empty;
+                let n;
+                {
+                    let buf = self.read_buf.as_mut().expect("read_buf checked above");
+                    n = buf.remaining().min(dst.remaining());
+                    dst.put_slice(&buf[..n]);
+                    buf.advance(n);
+                    empty = !buf.has_remaining();
+                }
+                self.recv
+                    .flow_control()
+                    .release_capacity(n)
+                    .map_err(to_io)?;
+                if empty {
                     self.read_buf = None;
                 }
                 return Poll::Ready(Ok(()));
@@ -564,14 +583,18 @@ impl AsyncRead for MeekStream {
 
             match futures::ready!(self.recv.poll_data(cx)) {
                 Some(Ok(chunk)) => {
-                    let _ = self.recv.flow_control().release_capacity(chunk.len());
                     if chunk.is_empty() {
                         continue;
                     }
                     self.read_buf = Some(chunk);
                 }
                 Some(Err(e)) => return Poll::Ready(Err(to_io(e))),
-                None => return Poll::Ready(Ok(())),
+                None => {
+                    if let Some(err) = self.driver_state.error() {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, err)));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -580,9 +603,12 @@ impl AsyncRead for MeekStream {
 impl AsyncWrite for MeekStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(err) = self.driver_state.error() {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, err)));
+        }
         if self.write_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -592,22 +618,63 @@ impl AsyncWrite for MeekStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.send.capacity() == 0 {
+            self.send
+                .reserve_capacity(buf.len().min(MAX_H2_WRITE_CHUNK));
+            match futures::ready!(self.send.poll_capacity(cx)) {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Poll::Ready(Err(to_io(e))),
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "fronted stream write side is closed",
+                    )));
+                }
+            }
+        }
+        let n = buf.len().min(self.send.capacity()).min(MAX_H2_WRITE_CHUNK);
+        if n == 0 {
+            return Poll::Pending;
+        }
         self.send
-            .send_data(Bytes::copy_from_slice(buf), false)
+            .send_data(Bytes::copy_from_slice(&buf[..n]), false)
             .map_err(to_io)?;
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(err) = self.driver_state.error() {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, err)));
+        }
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(err) = self.driver_state.error() {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, err)));
+        }
         if !self.write_closed {
             self.send.send_data(Bytes::new(), true).map_err(to_io)?;
             self.write_closed = true;
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+struct DriverState(Arc<Mutex<Option<String>>>);
+
+impl DriverState {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    fn set_error(&self, error: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+    }
+
+    fn error(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -656,8 +723,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (send_request, connection) = h2::client::handshake(io).await.map_err(to_io)?;
+    let driver_state = DriverState::new();
+    let driver_error = driver_state.clone();
+    let authority = authority.to_owned();
+    let driver_authority = authority.clone();
     let driver = DriverGuard(tokio::spawn(async move {
-        let _ = connection.await;
+        if let Err(e) = connection.await {
+            let error = e.to_string();
+            tracing::warn!(
+                authority = %driver_authority,
+                error = %error,
+                "fronted h2 connection driver failed"
+            );
+            driver_error.set_error(error);
+        }
     }));
 
     let request = Request::builder()
@@ -684,6 +763,7 @@ where
         send,
         read_buf: None,
         write_closed: false,
+        driver_state,
         _driver: driver,
     })
 }
@@ -764,10 +844,18 @@ impl FrontPool {
             };
             saw_provider = true;
             for m in &provider.masquerades {
+                let Some(endpoint) = FrontEndpoint::from_masquerade(m) else {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        fronted_host = %fronted_host,
+                        "skipping fronted masquerade with no domain or IP address"
+                    );
+                    continue;
+                };
                 fronts.push(Front {
                     provider: provider_id.clone(),
                     domain: m.domain.clone(),
-                    endpoint: FrontEndpoint::from_masquerade(m),
+                    endpoint,
                     sni: m.sni.clone(),
                     fronted_host: fronted_host.clone(),
                 });
@@ -791,23 +879,25 @@ impl FrontPool {
         for front in self.fronts_for_host(host)? {
             let addrs = match &front.endpoint {
                 FrontEndpoint::Ip(addr) => vec![*addr],
-                FrontEndpoint::Host { name, port } => {
-                    let ips = resolver
-                        .resolve(name)
-                        .await
-                        .map_err(|source| Error::Resolve {
-                            front: name.clone(),
-                            source,
-                        })?;
-                    if ips.is_empty() {
-                        return Err(Error::EmptyResolution {
-                            front: name.clone(),
-                        });
+                FrontEndpoint::Host { name, port } => match resolver.resolve(name).await {
+                    Ok(ips) => {
+                        if ips.is_empty() {
+                            tracing::warn!(front = %name, "skipping front with no A/AAAA records");
+                            continue;
+                        }
+                        ips.into_iter()
+                            .map(|ip| SocketAddr::new(ip, *port))
+                            .collect()
                     }
-                    ips.into_iter()
-                        .map(|ip| SocketAddr::new(ip, *port))
-                        .collect()
-                }
+                    Err(source) => {
+                        tracing::warn!(
+                            front = %name,
+                            error = %source,
+                            "skipping front after DNS resolution failed"
+                        );
+                        continue;
+                    }
+                },
             };
             let mut addrs = addrs;
             addrs.sort_unstable();
@@ -1019,6 +1109,15 @@ mod tests {
     impl FrontResolver for StaticResolver {
         async fn resolve(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct FailingResolver;
+
+    #[async_trait]
+    impl FrontResolver for FailingResolver {
+        async fn resolve(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
         }
     }
 
@@ -1241,6 +1340,56 @@ providers:
     }
 
     #[tokio::test]
+    async fn materialize_skips_unresolved_host_fronts_and_keeps_raw_ips() {
+        let cfg = parse_config_yaml(config_yaml()).unwrap();
+        let pool = FrontPool::new(&cfg, "");
+
+        let fronts = pool
+            .materialize("api.example.com", &FailingResolver)
+            .await
+            .unwrap();
+
+        assert_eq!(fronts.len(), 1);
+        assert_eq!(fronts[0].addrs, vec!["203.0.113.10:443".parse().unwrap()]);
+        assert_eq!(fronts[0].front.domain, "edge-one.example.net");
+    }
+
+    #[tokio::test]
+    async fn materialize_skips_empty_host_front_resolutions() {
+        let cfg = parse_config_yaml(config_yaml()).unwrap();
+        let pool = FrontPool::new(&cfg, "");
+
+        let fronts = pool
+            .materialize("api.example.com", &StaticResolver(vec![]))
+            .await
+            .unwrap();
+
+        assert_eq!(fronts.len(), 1);
+        assert_eq!(fronts[0].addrs, vec!["203.0.113.10:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn fronts_for_host_skips_malformed_masquerades() {
+        let cfg = parse_config_yaml(
+            br#"
+providers:
+  akamai:
+    hostaliases:
+      api.example.com: api.dsa.example.net
+    masquerades:
+      - domain: ""
+        ipaddress: ""
+"#,
+        )
+        .unwrap();
+        let pool = FrontPool::new(&cfg, "");
+
+        let fronts = pool.fronts_for_host("api.example.com").unwrap();
+
+        assert!(fronts.is_empty());
+    }
+
+    #[tokio::test]
     async fn dial_with_races_candidates_and_returns_front_metadata() {
         let cfg = parse_config_yaml(config_yaml()).unwrap();
         let pool = FrontPool::new(&cfg, "");
@@ -1379,6 +1528,45 @@ providers:
         assert_eq!(&out, b"pong");
         assert_eq!(stream.fronted_host(), "origin.example.net");
         seen_rx.await.unwrap();
+        server_seen.abort();
+    }
+
+    #[tokio::test]
+    async fn meek_stream_write_reports_only_capacity_accepted() {
+        let (client, server) = tokio::io::duplex(131_072);
+        let server_seen = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            let accepted = conn.accept().await.unwrap().unwrap();
+            tokio::spawn(async move {
+                let (request, mut respond) = accepted;
+                respond
+                    .send_response(Response::builder().status(200).body(()).unwrap(), false)
+                    .unwrap();
+                let mut body = request.into_body();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = body.data().await;
+            });
+            while conn.accept().await.is_some() {}
+        });
+
+        let conn = FrontedConnection {
+            stream: client,
+            front: Front {
+                provider: "akamai".into(),
+                domain: "edge.example.net".into(),
+                endpoint: FrontEndpoint::Ip("203.0.113.10:443".parse().unwrap()),
+                sni: String::new(),
+                fronted_host: "origin.example.net".into(),
+            },
+            addr: "203.0.113.10:443".parse().unwrap(),
+            candidate_index: 0,
+        };
+        let mut stream = conn.open_meek_stream(MeekOptions::default()).await.unwrap();
+        let buf = vec![0u8; MAX_H2_WRITE_CHUNK * 2];
+
+        let n = stream.stream.write(&buf).await.unwrap();
+
+        assert_eq!(n, MAX_H2_WRITE_CHUNK);
         server_seen.abort();
     }
 
