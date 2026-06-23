@@ -48,8 +48,8 @@ pub enum Error {
     Yaml(#[from] serde_yaml::Error),
     #[error("unknown provider `{0}`")]
     UnknownProvider(String),
-    #[error("provider `{provider}` has no fronting mapping for `{host}`")]
-    NoHostMapping { provider: String, host: String },
+    #[error("no fronting provider maps `{host}`")]
+    NoFrontingProvider { host: String },
     #[error("front `{front}` resolved to no usable A/AAAA records")]
     EmptyResolution { front: String },
     #[error("resolving front `{front}` failed: {source}")]
@@ -892,8 +892,7 @@ impl FrontPool {
             }
         }
         if fronts.is_empty() && !saw_provider {
-            return Err(Error::NoHostMapping {
-                provider: "*".into(),
+            return Err(Error::NoFrontingProvider {
                 host: host.to_owned(),
             });
         }
@@ -1111,10 +1110,23 @@ fn empty_opt(value: Option<&str>) -> bool {
 }
 
 fn strip_port(host: &str) -> &str {
-    host.rsplit_once(':')
-        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
-        .map(|(host, _)| host)
-        .unwrap_or(host)
+    // Bracketed IPv6 (`[::1]` / `[::1]:443`): keep everything through the closing bracket.
+    if host.starts_with('[') {
+        return match host.find(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        };
+    }
+    // Unbracketed: only strip a trailing `:<port>` when there is exactly one colon, so an
+    // unbracketed IPv6 literal (multiple colons, e.g. `2001:db8::1`) is left unchanged.
+    match host.rsplit_once(':') {
+        Some((h, port))
+            if !h.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            h
+        }
+        _ => host,
+    }
 }
 
 fn parse_endpoint(s: &str) -> Option<FrontEndpoint> {
@@ -1655,6 +1667,16 @@ providers:
             &fronts[0].verification,
             CertVerification::Roots { hostname, .. } if hostname == "provider.example.net"
         ));
+    }
+
+    #[test]
+    fn strip_port_handles_ports_and_ipv6() {
+        assert_eq!(strip_port("api.example.com"), "api.example.com");
+        assert_eq!(strip_port("api.example.com:443"), "api.example.com");
+        // An unbracketed IPv6 literal must not have its last hextet mistaken for a port.
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        assert_eq!(strip_port("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(strip_port("[2001:db8::1]:443"), "[2001:db8::1]");
     }
 
     #[test]
