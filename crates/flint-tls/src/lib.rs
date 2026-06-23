@@ -10,7 +10,9 @@
 //!   connector decisions boring can express ([`Profile`]), surfacing what it can't.
 //! - [`ja4`] — FoxIO **JA4** fingerprinting of a raw ClientHello, for anchor/drift control.
 //! - [`connector`] *(feature `boring`)* — the boring2 Chrome-137 TLS connector that applies a
-//!   [`Profile`]; [`anchor`] *(feature `boring`)* captures its ClientHello and pins the JA4.
+//!   [`Profile`]; [`connect`] preserves the no-verify bootstrap carrier behavior, while
+//!   [`connect_with`] can verify a peer certificate chain and hostname independently from SNI.
+//!   [`anchor`] *(feature `boring`)* captures its ClientHello and pins the JA4.
 //!
 //! The `boring` feature gates the only part that needs the C/cmake BoringSSL build, so the base build
 //! is pure-Rust. Extracted from spark's `core::transport` (`anytls::tls`/`profile`, `gambit`, `ja4`,
@@ -28,5 +30,24 @@ pub mod connector;
 
 pub use profile::Profile;
 
+/// Certificate verification policy for a TLS connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CertVerification {
+    /// Do not verify the peer certificate or hostname.
+    #[default]
+    None,
+    /// Verify the peer certificate against the supplied PEM roots, or system roots when empty, and
+    /// verify the certificate for `hostname`. The hostname is the identity being verified and is
+    /// intentionally separate from ClientHello SNI.
+    ///
+    /// `roots_pem` is an `Arc<[String]>` so one root set is shared cheaply across the many per-front /
+    /// per-address strategies a fronting dial fans out into (clone is a refcount bump, not a deep copy
+    /// of the PEM data).
+    Roots {
+        roots_pem: std::sync::Arc<[String]>,
+        hostname: String,
+    },
+}
+
 #[cfg(feature = "boring")]
-pub use connector::{configure, connect};
+pub use connector::{configure, connect, connect_with};

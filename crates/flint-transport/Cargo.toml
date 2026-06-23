@@ -1,0 +1,17 @@
+[package]
+name = "flint-transport"
+description = "Connection-based transport traits and races for Rust Kindling-style bootstrap."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "time"] }

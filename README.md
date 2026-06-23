@@ -26,6 +26,9 @@ See [`docs/design.md`](docs/design.md) for the full design, and
 | `flint-tls` | Chrome-mimicry TLS: the boring Chrome-ClientHello connector, the gambit CH genome, JA4. |
 | `flint-dial` | The composable `BootstrapDial` engine — executes a strategy `(endpoint, transport, engine, ch_profile, sni_tactic, wire_plan)`. |
 | `flint-dns` | The resilient DoH resolver + a minimal A/AAAA DNS codec (first `BootstrapDial` consumer). |
+| `flint-transport` | Connection-first transport traits plus boxed transport racing for Rust Kindling-style bootstrap. |
+| `flint-fronted` | Connection-first domain fronting: Lantern `fronted.yaml.gz` parsing, raw-IP and host-front materialization through `flint-dns`, raced fronted TLS dialing, and optional meek-style H2 byte streams. |
+| `flint-kindling` | Thin connection-first Kindling orchestrator: register boxed transports, race them, return the winning byte stream. |
 
 ## Relationship to spark
 

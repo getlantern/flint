@@ -24,6 +24,7 @@ mod race;
 mod strategy;
 
 pub use engine::{dial, dial_over};
+pub use flint_tls::CertVerification;
 pub use race::{probe_windowed, race, race_windowed, race_with};
 pub use strategy::{BootstrapStrategy, TlsEngine};
 
