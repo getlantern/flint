@@ -8,10 +8,13 @@
 //! byte-builder / a patched fork).
 //!
 //! What boring2 4.15 expresses (verified against the crate source): GREASE on/off, extension
-//! permutation on/off (no seed control), the supported-groups list (so PQ X25519MLKEM768 is
-//! includable), `record_size_limit`, ECH grease, ALPS. What it does **not**: explicit extension/
-//! cipher order by id, an exact GREASE/permutation seed, ClientHello padding-to-length,
-//! `legacy_session_id` injection, and TLS-record split offsets.
+//! permutation on/off (no seed control), **explicit extension order by id**
+//! (`set_extension_permutation`), **explicit cipher order by id** (ordered `set_cipher_list`), the
+//! supported-groups list (so PQ X25519MLKEM768 is includable), `record_size_limit`, ECH grease,
+//! ALPS, and **`legacy_session_id` injection** (the kID recipe in [`crate::connector`]); TLS-record
+//! split offsets are realized one layer down by `flint_shaping`. What it still does **not** (P4b /
+//! await the byte-builder or a patched fork): an exact GREASE/permutation seed, ClientHello
+//! padding-to-length, and a raw ClientHello.
 //!
 //! Pure data mapping — no boring dependency. The resulting [`Profile`] (plain on/off values) is what
 //! [`crate::connector`] applies to the boring connector under the `boring` feature.
@@ -147,8 +150,8 @@ impl Profile {
 
     /// Resolve a **signed-and-verified** gambit onto boring, first gating its `requires` against
     /// [`BORING_CAPABILITIES`]. Returns `Err` (declines the gambit) if it needs a capability boring
-    /// lacks (`session_id_inject` / `raw_clienthello`); the caller then falls back to its best
-    /// portable gambit.
+    /// lacks (`raw_clienthello`); the caller then falls back to its best portable gambit. (Note
+    /// `session_id_inject` is now realized, so it no longer declines a gambit.)
     pub fn for_boring(g: &Gambit) -> Result<Resolved, GambitError> {
         g.check_supported(BORING_CAPABILITIES)?;
         Ok(Self::resolve(&g.clienthello, &g.records))

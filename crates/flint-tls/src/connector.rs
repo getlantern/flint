@@ -11,6 +11,7 @@
 //! carrier. Fingerprint freshness is covered by the JA4 drift check ([`crate::anchor`]) and the
 //! update-mimicry CI.
 
+use std::borrow::Cow;
 use std::io;
 
 use boring2::ssl::{
@@ -123,20 +124,20 @@ pub fn configure(profile: &Profile) -> io::Result<ConnectConfiguration> {
     b.set_sigalgs_list(CHROME_SIGALGS)
         .map_err(|e| ssl(e, "sigalgs"))?;
     // Cipher order: an explicit gambit list builds an owned ":"-joined name string in that order;
-    // otherwise the pinned Chrome list.
-    let cipher_list = match &profile.cipher_order {
+    // otherwise borrow the pinned Chrome list (no per-connection allocation in the common case).
+    let cipher_list: Cow<'static, str> = match &profile.cipher_order {
         Some(ids) => {
             let list = cipher_ids_to_list(ids);
             if list.is_empty() {
                 tracing::warn!(
                     "gambit cipher_order mapped to no known ciphers; using the Chrome default"
                 );
-                CHROME_CIPHERS.to_owned()
+                Cow::Borrowed(CHROME_CIPHERS)
             } else {
-                list
+                Cow::Owned(list)
             }
         }
-        None => CHROME_CIPHERS.to_owned(),
+        None => Cow::Borrowed(CHROME_CIPHERS),
     };
     b.set_cipher_list(&cipher_list)
         .map_err(|e| ssl(e, "ciphers"))?;
