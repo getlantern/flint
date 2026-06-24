@@ -1,0 +1,127 @@
+# Cloudflare DoH edge IPs — verified-working reference snapshot
+#
+# 100 Cloudflare anycast edge IPs confirmed serving `cloudflare-dns.com` DoH
+# (HTTP/2, RFC 8484 / JSON `Status:0`) on 2026-06-24 from a US vantage.
+#
+# How: harvested A-records from ~4,200 top domains, filtered to Cloudflare's
+# announced ranges, then probed each with SNI/Host = cloudflare-dns.com. A 206-IP
+# sample verified 100% — any live, site-backed CF anycast IP answers the resolver,
+# because Cloudflare runs DoH on the same global edge that fronts every CF site.
+#
+# Caveats:
+#  - Anycast reachability is VANTAGE-DEPENDENT; a client elsewhere gets a different
+#    (overlapping) working subset. The ranges are globally announced, the specific
+#    live /32s vary by PoP catchment.
+#  - IPs CHURN. This is a point-in-time snapshot, not a stable set.
+#  - A censor blocks by RANGE, not by IP — so range coverage matters far more than
+#    count. These 100 span only 5 ranges (top sites don't use CF's regional ranges).
+#
+# Use: a reference/candidate set for expanding flint-dns `default_pool()` or a future
+# Ed25519-signed pool update. NOT auto-loaded by the crate (the baked-in pool embeds
+# a small range-diverse subset; see pool.rs).
+#
+# 104.16.0.0/13
+104.16.3.81
+104.16.24.14
+104.16.61.116
+104.16.107.116
+104.16.125.63
+104.16.134.27
+104.16.143.237
+104.16.224.31
+104.17.29.26
+104.17.86.45
+104.17.96.195
+104.17.145.110
+104.17.235.108
+104.18.0.50
+104.18.0.112
+104.18.13.173
+104.18.16.206
+104.18.20.57
+104.18.24.146
+104.18.25.4
+104.18.30.188
+104.18.115.121
+104.18.116.121
+104.18.194.13
+# 104.24.0.0/14
+104.25.102.4
+104.25.107.109
+104.26.0.8
+104.26.1.86
+104.26.1.105
+104.26.1.163
+104.26.1.177
+104.26.1.232
+104.26.10.61
+104.26.10.151
+104.26.11.188
+104.26.11.230
+104.26.12.2
+104.26.12.43
+104.26.12.185
+104.26.12.249
+104.26.13.43
+104.26.13.171
+104.26.13.190
+104.26.13.242
+104.26.14.122
+104.26.14.220
+104.26.15.23
+104.26.15.175
+# 172.64.0.0/13
+172.64.145.202
+172.64.148.24
+172.64.148.79
+172.64.148.97
+172.64.150.216
+172.64.152.164
+172.64.153.89
+172.65.64.50
+172.66.0.37
+172.66.1.111
+172.66.1.220
+172.66.135.106
+172.66.136.2
+172.66.136.122
+172.66.138.195
+172.66.148.112
+172.66.149.36
+172.66.151.162
+172.66.152.191
+172.66.156.78
+172.66.162.11
+172.66.166.111
+172.66.167.42
+172.66.167.143
+# 162.158.0.0/15
+162.159.128.61
+162.159.128.65
+162.159.128.70
+162.159.128.233
+162.159.129.35
+162.159.129.67
+162.159.129.70
+162.159.129.91
+162.159.129.233
+162.159.130.35
+162.159.130.67
+162.159.130.233
+162.159.130.234
+162.159.133.233
+162.159.133.234
+162.159.134.42
+162.159.134.233
+162.159.134.234
+162.159.135.42
+162.159.135.232
+162.159.135.233
+162.159.135.234
+162.159.136.232
+162.159.136.234
+# 141.101.64.0/18
+141.101.90.100
+141.101.90.101
+141.101.90.102
+141.101.90.103
