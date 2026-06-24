@@ -8,9 +8,12 @@
 //! - **raw-IP**: dial the resolver's own dedicated IP, presenting its hostname as SNI + DoH
 //!   `:authority`.
 //! - **CDN-edge** (the design's spearhead): dial the resolver over a **high-collateral CDN range**
-//!   (e.g. Cloudflare DoH on `104.16/12`, which serves millions of sites) instead of the well-known
-//!   dedicated IP — blocking that range is collateral-expensive. Same real SNI/host (not domain
-//!   fronting), just a far harder-to-block address.
+//!   instead of its well-known dedicated IP — e.g. Cloudflare answers `cloudflare-dns.com` DoH on
+//!   *any* live edge IP across its announced ranges (`104.16.0.0/13`, `104.24.0.0/14`,
+//!   `172.64.0.0/13`, `162.158.0.0/15`, …), each carrying millions of sites, so blocking them is
+//!   collateral-expensive.
+//!   Same real SNI/host (not domain fronting), just far harder-to-block addresses. This is
+//!   Cloudflare-specific (its resolver shares the general CDN edge); see [`default_pool`].
 //!
 //! Ed25519-signed pool updates are layered on later (design §6).
 
@@ -69,14 +72,38 @@ fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
 /// **no-threat-blocking** `9.9.9.10` so a flagged config host is never `NXDOMAIN`'d out from under us.
 pub fn default_pool() -> Vec<Resolver> {
     vec![
-        // CDN-edge spearhead: Cloudflare DoH over its high-collateral CDN range (104.16/12), not the
-        // well-known 1.1.1.1 — same cert/SNI/host, far costlier for a censor to block.
+        // CDN-edge spearhead: Cloudflare runs its DoH resolver on the *same* global anycast edge that
+        // fronts millions of unrelated sites, so `cloudflare-dns.com` DoH answers on **any** live
+        // Cloudflare edge IP given the right SNI/host — not just the well-known 1.1.1.1. We spread the
+        // entries across **four** of Cloudflare's distinct announced ranges (104.16.0.0/13,
+        // 104.24.0.0/14, 172.64.0.0/13, 162.158.0.0/15), **two IPs each**, so a censor must block every
+        // one and eat the collateral of each (every range carries a huge slice of the web). All
+        // verified live 2026-06-24; these are representative anycast edges — the 104.16 pair are the
+        // official `cloudflare-dns.com` A-records, the rest are live edges harvested from unrelated
+        // CF-fronted sites. The pool races and per-network-caches the winner, so churn of any single IP
+        // is absorbed (two per range gives redundancy against that). NB: this edge-spread trick is
+        // Cloudflare-specific: Google (`dns.google`, 8.8.x) and AliDNS (`dns.alidns.com`, 223.5.x) serve
+        // DoH only on dedicated anycast, not a shared CDN, so they stay raw-IP below.
+        // 104.16.0.0/13 (the official cloudflare-dns.com A-records):
         v4("cloudflare-edge", [104, 16, 249, 249], "cloudflare-dns.com"),
         v4(
             "cloudflare-edge2",
             [104, 16, 248, 249],
             "cloudflare-dns.com",
         ),
+        // 104.24.0.0/14:
+        v4("cloudflare-edge3", [104, 26, 5, 189], "cloudflare-dns.com"),
+        v4("cloudflare-edge4", [104, 26, 4, 189], "cloudflare-dns.com"),
+        // 172.64.0.0/13:
+        v4("cloudflare-edge5", [172, 67, 68, 111], "cloudflare-dns.com"),
+        v4("cloudflare-edge6", [172, 65, 251, 78], "cloudflare-dns.com"),
+        // 162.158.0.0/15:
+        v4(
+            "cloudflare-edge7",
+            [162, 159, 136, 232],
+            "cloudflare-dns.com",
+        ),
+        v4("cloudflare-edge8", [162, 159, 152, 4], "cloudflare-dns.com"),
         // Raw-IP forms (dedicated resolver anycast).
         v4("cloudflare", [1, 1, 1, 1], "cloudflare-dns.com"),
         v4("cloudflare2", [1, 0, 0, 1], "cloudflare-dns.com"),
