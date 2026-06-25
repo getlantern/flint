@@ -89,8 +89,10 @@ async fn meek_live_auto_alpn_through_akamai_to_example_com() {
         }
     }
     let text = String::from_utf8_lossy(&buf);
+    // Assert on a real HTTP/1.1 status line and the expected body marker, not a
+    // bare "200" substring that could appear anywhere in the bytes.
     assert!(
-        text.contains("200") || text.contains("Example Domain"),
+        text.starts_with("HTTP/1.1 200") && text.contains("Example Domain"),
         "unexpected response (first 200B): {:?}",
         &text.chars().take(200).collect::<String>()
     );
