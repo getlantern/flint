@@ -1130,6 +1130,11 @@ where
         .uri(format!("https://{authority}{}", normalize_path(&req.path)))
         .header(http::header::HOST, authority);
     for (name, value) in &req.headers {
+        // The Host/:authority is derived from the connection authority above; a caller-supplied host
+        // would duplicate or override it and break fronting, so skip it (see OneshotRequest::header).
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         builder = builder.header(name.as_str(), value.as_str());
     }
     let request = builder.body(()).map_err(to_io)?;
@@ -1139,8 +1144,17 @@ where
     let (response, mut send) = send_request
         .send_request(request, end_stream)
         .map_err(to_io)?;
-    if !end_stream {
-        send.send_data(req.body.clone(), true).map_err(to_io)?;
+    // Stream the body respecting HTTP/2 flow control: reserve capacity, await the peer's window, and
+    // send in bounded chunks — a single send_data can exceed the stream's initial send window.
+    let mut remaining = req.body.clone();
+    while !remaining.is_empty() {
+        send.reserve_capacity(remaining.len().min(MAX_H2_WRITE_CHUNK));
+        let granted = std::future::poll_fn(|cx| send.poll_capacity(cx))
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "h2 send stream closed"))?
+            .map_err(to_io)?;
+        let chunk = remaining.split_to(granted.min(remaining.len()));
+        send.send_data(chunk, remaining.is_empty()).map_err(to_io)?;
     }
 
     let response = response.await.map_err(to_io)?;
@@ -1148,11 +1162,12 @@ where
     let headers = response
         .headers()
         .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_owned(),
-                v.to_str().unwrap_or_default().to_owned(),
-            )
+        .filter_map(|(k, v)| {
+            // Skip non-UTF-8 header values rather than silently coercing them to empty strings (the
+            // headers config bootstrap inspects — ETag, Content-Type — are ASCII).
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_owned(), v.to_owned()))
         })
         .collect();
     let mut body = Vec::new();
