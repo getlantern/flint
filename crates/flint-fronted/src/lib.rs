@@ -121,13 +121,14 @@ impl Provider {
     }
 
     pub fn expanded(&self, country_code: &str) -> Self {
-        let sni_cfg = if country_code.is_empty() {
-            None
-        } else {
-            self.fronting_snis
-                .get(country_code)
-                .or_else(|| self.fronting_snis.get("default"))
-        };
+        // The "default" SNI bucket applies even when no country code is set: the production client
+        // passes none, and gating "default" behind a non-empty country code would leave a provider
+        // whose only bucket is "default" (e.g. the aliyun provider) permanently inert. An unknown
+        // non-empty country code also falls back to "default". Matches domainfront::ExpandedProvider.
+        let sni_cfg = self
+            .fronting_snis
+            .get(country_code)
+            .or_else(|| self.fronting_snis.get("default"));
         Provider {
             host_aliases: self
                 .host_aliases
@@ -145,7 +146,13 @@ impl Provider {
                 .iter()
                 .map(|m| {
                     let mut out = m.clone();
-                    out.sni = generate_sni(sni_cfg, &m.ip_address);
+                    // A generated (arbitrary) SNI takes precedence; otherwise keep any SNI baked
+                    // into the masquerade by the config (empty stays empty → SNI omitted on the
+                    // wire). Matches domainfront::ExpandedProvider.
+                    let generated = generate_sni(sni_cfg, &m.ip_address);
+                    if !generated.is_empty() {
+                        out.sni = generated;
+                    }
                     if empty_opt(out.verify_hostname.as_deref()) {
                         out.verify_hostname = self.verify_hostname.clone();
                     }
@@ -1525,6 +1532,67 @@ providers:
             .masquerades
             .iter()
             .all(|m| m.verify_hostname.as_deref() == Some("verify.example.net")));
+    }
+
+    #[test]
+    fn default_sni_bucket_applies_with_empty_country_code() {
+        // The production client passes no country code, yet a provider whose only frontingsnis
+        // bucket is "default" with usearbitrarysnis (the aliyun provider's shape) must still apply
+        // its arbitrary-SNI strategy. Regression for the old `fronted` gate that left "default"
+        // inert on an empty CC — which would have dialed aliyun edges with no img.alicdn.com SNI.
+        let yaml = br#"
+trustedcas: []
+providers:
+  aliyun:
+    hostaliases:
+      df.iantem.io: df.dcdn.getiantem.org
+    frontingsnis:
+      default:
+        usearbitrarysnis: true
+        arbitrarysnis:
+          - img.alicdn.com
+          - gw.alicdn.com
+          - a.alicdn.com
+    masquerades:
+      - domain: img.alicdn.com
+        ipaddress: "122.226.74.97"
+        sni: ""
+      - domain: img.alicdn.com
+        ipaddress: "155.102.181.137"
+        sni: ""
+"#;
+        let cfg = parse_config_yaml(yaml).unwrap();
+        let provider = cfg.providers.get("aliyun").unwrap().expanded("");
+        let snis: Vec<_> = provider
+            .masquerades
+            .iter()
+            .map(|m| m.sni.as_str())
+            .collect();
+        assert!(
+            snis.iter().all(|s| !s.is_empty()),
+            "default bucket must apply with an empty country code"
+        );
+        assert!(snis
+            .iter()
+            .all(|s| ["img.alicdn.com", "gw.alicdn.com", "a.alicdn.com"].contains(s)));
+    }
+
+    #[test]
+    fn baked_in_masquerade_sni_is_preserved_without_arbitrary_snis() {
+        // A provider can pin a per-masquerade SNI without an arbitrary-SNI bucket; expansion must
+        // not clobber it with an empty generated SNI (matches domainfront::ExpandedProvider).
+        let yaml = br#"
+trustedcas: []
+providers:
+  pinned:
+    masquerades:
+      - domain: front.example.net
+        ipaddress: "203.0.113.5"
+        sni: pinned.example.net
+"#;
+        let cfg = parse_config_yaml(yaml).unwrap();
+        let provider = cfg.providers.get("pinned").unwrap().expanded("");
+        assert_eq!(provider.masquerades[0].sni, "pinned.example.net");
     }
 
     #[tokio::test]
