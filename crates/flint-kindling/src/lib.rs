@@ -10,7 +10,8 @@ pub use flint_transport::{
 };
 
 pub use flint_fronted::{
-    DirectH2Dialer, FlintDnsResolver, FrontResolver, FrontedMeekDialer, FrontedTlsDialer,
+    h2_oneshot, DirectH2Dialer, FlintDnsResolver, FrontResolver, FrontedMeekDialer,
+    FrontedTlsDialer, HttpResponse, OneshotRequest,
 };
 
 pub struct Kindling {

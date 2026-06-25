@@ -404,6 +404,37 @@ impl<R: FrontResolver> FrontedTlsDialer<R> {
             .dial_with(host, &self.resolver, self.dial_options.clone(), dial_one)
             .await
     }
+
+    /// Run a one-shot [`OneshotRequest`] over a fronted connection, returning the full
+    /// [`HttpResponse`]. Each masquerade candidate runs the full dial + request, so a candidate wins
+    /// only after a complete response; the inner request addresses the provider's fronted host.
+    pub async fn request(&self, host: &str, req: &OneshotRequest) -> Result<HttpResponse, Error> {
+        self.request_with(host, req, |strategy| async move {
+            flint_dial::dial(&strategy).await
+        })
+        .await
+    }
+
+    /// [`request`](Self::request) with an injectable per-strategy dial step (the test seam).
+    pub async fn request_with<F, Fut, T>(
+        &self,
+        host: &str,
+        req: &OneshotRequest,
+        dial_one: F,
+    ) -> Result<HttpResponse, Error>
+    where
+        F: FnMut(BootstrapStrategy) -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let fronts = self.pool.materialize(host, &self.resolver).await?;
+        let candidates: Vec<(BootstrapStrategy, String)> =
+            candidates(&fronts, self.dial_options.wire.clone())
+                .into_iter()
+                .map(|candidate| (candidate.strategy, candidate.front.fronted_host))
+                .collect();
+        race_oneshot(host, candidates, &self.dial_options, req, dial_one).await
+    }
 }
 
 #[async_trait]
@@ -720,6 +751,58 @@ impl<R: FrontResolver> DirectH2Dialer<R> {
             }),
         }
     }
+
+    /// Run a one-shot [`OneshotRequest`] against the origin directly (racing the resolved addresses),
+    /// returning the full [`HttpResponse`]. The request body is sent before the response is awaited,
+    /// so this works against an ordinary read-body-then-respond POST origin.
+    pub async fn request(&self, host: &str, req: &OneshotRequest) -> Result<HttpResponse, Error> {
+        self.request_with(host, req, |strategy| async move {
+            flint_dial::dial(&strategy).await
+        })
+        .await
+    }
+
+    /// [`request`](Self::request) with an injectable per-strategy dial step (the test seam).
+    pub async fn request_with<F, Fut, T>(
+        &self,
+        host: &str,
+        req: &OneshotRequest,
+        dial_one: F,
+    ) -> Result<HttpResponse, Error>
+    where
+        F: FnMut(BootstrapStrategy) -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let host = strip_port(host).to_ascii_lowercase();
+        let ips = self
+            .resolver
+            .resolve(&host)
+            .await
+            .map_err(|source| Error::Resolve {
+                front: host.clone(),
+                source,
+            })?;
+        if ips.is_empty() {
+            return Err(Error::EmptyResolution { front: host });
+        }
+        let verification = CertVerification::Roots {
+            roots_pem: self.trusted_roots.clone(),
+            hostname: host.clone(),
+        };
+        let candidates: Vec<(BootstrapStrategy, String)> = ips
+            .into_iter()
+            .map(|ip| {
+                (
+                    BootstrapStrategy::boring_chrome(SocketAddr::new(ip, self.port), host.clone())
+                        .with_wire(self.dial_options.wire.clone())
+                        .with_verification(verification.clone()),
+                    host.clone(),
+                )
+            })
+            .collect();
+        race_oneshot(&host, candidates, &self.dial_options, req, dial_one).await
+    }
 }
 
 #[async_trait]
@@ -953,6 +1036,193 @@ where
         driver_state,
         _driver: driver,
     })
+}
+
+/// A one-shot HTTP request to run over a fronted or direct h2 connection — for the small
+/// request/response exchanges typical of bootstrap (e.g. a config fetch), as opposed to the
+/// bidirectional [`MeekStream`] tunnel. The whole request (headers **and** body) is sent before the
+/// response is awaited, so it works against an ordinary read-body-then-respond origin (a POST API),
+/// which the respond-first meek stream cannot.
+#[derive(Debug, Clone)]
+pub struct OneshotRequest {
+    pub method: Method,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+    /// Cap on the collected response body; a larger response errors rather than allocating unbounded.
+    pub max_body: usize,
+}
+
+impl OneshotRequest {
+    const DEFAULT_MAX_BODY: usize = 4 * 1024 * 1024;
+
+    /// A `POST {path}` carrying `body`.
+    pub fn post(path: impl Into<String>, body: impl Into<Bytes>) -> Self {
+        Self {
+            method: Method::POST,
+            path: path.into(),
+            headers: Vec::new(),
+            body: body.into(),
+            max_body: Self::DEFAULT_MAX_BODY,
+        }
+    }
+
+    /// A `GET {path}` with no body.
+    pub fn get(path: impl Into<String>) -> Self {
+        Self {
+            method: Method::GET,
+            path: path.into(),
+            headers: Vec::new(),
+            body: Bytes::new(),
+            max_body: Self::DEFAULT_MAX_BODY,
+        }
+    }
+
+    /// Append a request header (the `Host`/`:authority` is set from the connection's authority and
+    /// must not be set here).
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Override the response-body cap (default 4 MiB).
+    pub fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+}
+
+/// The collected response from a [`OneshotRequest`].
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// First header matching `name` (case-insensitive), if any.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Run a single [`OneshotRequest`] over the established byte stream `io`, addressing `authority` (the
+/// h2 `:authority`/`Host`). Sends the complete request (headers + body, end-of-stream) and collects
+/// the full response. Distinct from [`open_meek_stream`]/[`h2_request_stream`], which keep a
+/// bidirectional stream open and await the response *before* any body is sent.
+pub async fn h2_oneshot<S>(io: S, authority: &str, req: &OneshotRequest) -> io::Result<HttpResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (send_request, connection) = h2::client::handshake(io).await.map_err(to_io)?;
+    // The connection future must be driven for the stream to make progress; keep it alive until the
+    // response body is fully read, then the guard aborts it on drop.
+    let _driver = DriverGuard(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+
+    let mut builder = Request::builder()
+        .method(req.method.clone())
+        .uri(format!("https://{authority}{}", normalize_path(&req.path)))
+        .header(http::header::HOST, authority);
+    for (name, value) in &req.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let request = builder.body(()).map_err(to_io)?;
+
+    let mut send_request = send_request.ready().await.map_err(to_io)?;
+    let end_stream = req.body.is_empty();
+    let (response, mut send) = send_request
+        .send_request(request, end_stream)
+        .map_err(to_io)?;
+    if !end_stream {
+        send.send_data(req.body.clone(), true).map_err(to_io)?;
+    }
+
+    let response = response.await.map_err(to_io)?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_owned(),
+                v.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let mut body = Vec::new();
+    let mut recv = response.into_body();
+    while let Some(chunk) = recv.data().await {
+        let chunk = chunk.map_err(to_io)?;
+        if body.len() + chunk.len() > req.max_body {
+            return Err(io::Error::other("oneshot response body exceeds max_body"));
+        }
+        recv.flow_control()
+            .release_capacity(chunk.len())
+            .map_err(to_io)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Race `candidates` (each a dial strategy + the `:authority` to address once connected), running the
+/// full direct/fronted dial **and** the [`h2_oneshot`] request per candidate so a candidate wins only
+/// after a complete response. `dial_one` performs the per-strategy TLS dial (injectable for tests).
+async fn race_oneshot<F, Fut, T>(
+    host: &str,
+    candidates: Vec<(BootstrapStrategy, String)>,
+    options: &DialOptions,
+    req: &OneshotRequest,
+    mut dial_one: F,
+) -> Result<HttpResponse, Error>
+where
+    F: FnMut(BootstrapStrategy) -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if candidates.is_empty() {
+        return Err(Error::NoUsableFronts {
+            host: host.to_owned(),
+        });
+    }
+    let timeout = options.attempt_timeout;
+    match flint_dial::race_windowed(candidates.len(), options.window, |i| {
+        let (strategy, authority) = candidates[i].clone();
+        let fut = dial_one(strategy);
+        let req = req.clone();
+        async move {
+            let connect = async move {
+                let tls = fut.await?;
+                h2_oneshot(tls, &authority, &req).await
+            };
+            match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, connect)
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "oneshot attempt timed out")
+                    })
+                    .and_then(|result| result),
+                None => connect.await,
+            }
+        }
+    })
+    .await
+    {
+        Ok((_, response)) => Ok(response),
+        Err(errors) => Err(Error::DialFailed {
+            tried: candidates.len(),
+            errors: join_errors(errors),
+        }),
+    }
 }
 
 #[async_trait]
@@ -2271,6 +2541,130 @@ providers:
         assert_eq!(&out, b"pong");
         // Direct dial presents the real origin SNI, not a decoy front.
         assert_eq!(seen_rx.await.unwrap(), Some("df.iantem.io".into()));
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn direct_h2_oneshot_sends_body_before_awaiting_response() {
+        // config-new is a POST whose origin reads the request body *before* responding. The oneshot
+        // sends the full request (body included) up front, so this read-then-respond server works —
+        // where the respond-first meek stream would deadlock.
+        let ca = test_ca();
+        let resolver = StaticResolver(vec!["198.51.100.20".parse().unwrap()]);
+        let dialer = DirectH2Dialer::new(resolver)
+            .with_dial_options(DialOptions {
+                window: 1,
+                attempt_timeout: None,
+                ..Default::default()
+            })
+            .with_trusted_roots(vec![ca.pem.clone()]);
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "df.iantem.io"));
+        let req = OneshotRequest::post("/api/v1/config-new", &b"device=abc"[..])
+            .header("content-type", "application/json");
+
+        let resp = dialer
+            .request_with("df.iantem.io", &req, move |strategy| {
+                let acceptor = acceptor.clone();
+                async move {
+                    let (client, server) = tokio::io::duplex(128 * 1024);
+                    tokio::spawn(async move {
+                        let tls = tokio_boring2::accept(&acceptor, server).await.unwrap();
+                        let mut h2 = h2::server::handshake(tls).await.unwrap();
+                        let accepted = h2.accept().await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let (request, mut respond) = accepted;
+                            assert_eq!(request.method(), Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/config-new");
+                            assert_eq!(request.headers()[http::header::HOST], "df.iantem.io");
+                            // Read the body FIRST, then respond — the config-new ordering.
+                            let mut body = request.into_body();
+                            let chunk = body.data().await.unwrap().unwrap();
+                            assert_eq!(&chunk[..], b"device=abc");
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            let mut send = respond
+                                .send_response(
+                                    Response::builder().status(200).body(()).unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                            send.send_data(Bytes::from_static(b"{\"servers\":[]}"), true)
+                                .unwrap();
+                        });
+                        while h2.accept().await.is_some() {}
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"{\"servers\":[]}");
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn fronted_tls_oneshot_request_over_verified_front() {
+        // A one-shot request over the fronted TLS path: decoy SNI on the wire, the inner request
+        // addressed to the provider's fronted host, body sent before the response is awaited.
+        let ca = test_ca();
+        let cfg = verified_config(ca.pem.clone(), "cover.example");
+        let dialer = FrontedTlsDialer::new(&cfg, "us", StaticResolver(vec![])).with_dial_options(
+            DialOptions {
+                window: 1,
+                attempt_timeout: None,
+                ..Default::default()
+            },
+        );
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "edge.test"));
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let req = OneshotRequest::post("/api/v1/config-new", &b"hello"[..]);
+
+        let resp = dialer
+            .request_with("api.example.com", &req, move |strategy| {
+                let acceptor = acceptor.clone();
+                let seen_tx = seen_tx.lock().unwrap().take();
+                async move {
+                    let (client, server) = tokio::io::duplex(128 * 1024);
+                    tokio::spawn(async move {
+                        let tls = tokio_boring2::accept(&acceptor, server).await.unwrap();
+                        let seen = tls
+                            .ssl()
+                            .servername(NameType::HOST_NAME)
+                            .map(ToOwned::to_owned);
+                        if let Some(tx) = seen_tx {
+                            let _ = tx.send(seen);
+                        }
+                        let mut h2 = h2::server::handshake(tls).await.unwrap();
+                        let accepted = h2.accept().await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let (request, mut respond) = accepted;
+                            assert_eq!(request.headers()[http::header::HOST], "origin.example.net");
+                            let mut body = request.into_body();
+                            let chunk = body.data().await.unwrap().unwrap();
+                            assert_eq!(&chunk[..], b"hello");
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            let mut send = respond
+                                .send_response(
+                                    Response::builder().status(200).body(()).unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                            send.send_data(Bytes::from_static(b"ok"), true).unwrap();
+                        });
+                        while h2.accept().await.is_some() {}
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+        // The decoy SNI is on the wire; the inner request used the fronted host.
+        assert_eq!(seen_rx.await.unwrap(), Some("cover.example".into()));
     }
 
     #[tokio::test]
