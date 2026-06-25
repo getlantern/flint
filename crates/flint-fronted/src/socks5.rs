@@ -32,8 +32,10 @@ pub async fn connect<S>(stream: &mut S, target: &Target) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Method select: VER=5, NMETHODS=1, NO_AUTH(0x00).
+    // Method select: VER=5, NMETHODS=1, NO_AUTH(0x00). Flush so a buffered writer
+    // actually sends it before we wait for the reply (else read_exact can hang).
     stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    stream.flush().await?;
     let mut sel = [0u8; 2];
     stream.read_exact(&mut sel).await?;
     if sel[0] != 0x05 {
@@ -74,6 +76,7 @@ where
         }
     }
     stream.write_all(&req).await?;
+    stream.flush().await?;
 
     // Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT. Read the fixed head, then
     // the address whose length depends on ATYP, then the 2-byte port.
