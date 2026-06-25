@@ -53,16 +53,11 @@ const HEADER_MAX_BODY: &str = "x-meek-max-body";
 /// [`crate::dial_fronts_alpn`] (the boring Chrome dial offers `h2,http/1.1` and
 /// the edge picks — e.g. the deployed Akamai meek endpoint negotiates h1). This
 /// enum is for the cases that force a version explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MeekHttpVersion {
     H1,
+    #[default]
     H2,
-}
-
-impl Default for MeekHttpVersion {
-    fn default() -> Self {
-        MeekHttpVersion::H2
-    }
 }
 
 /// Runtime configuration for a [`MeekPollConn`]. Mirrors lantern-box `meek.Config`.
