@@ -9,7 +9,9 @@ pub use flint_transport::{
     RaceOptions, TransportConnection,
 };
 
-pub use flint_fronted::{FlintDnsResolver, FrontResolver, FrontedMeekDialer, FrontedTlsDialer};
+pub use flint_fronted::{
+    DirectH2Dialer, FlintDnsResolver, FrontResolver, FrontedMeekDialer, FrontedTlsDialer,
+};
 
 pub struct Kindling {
     transports: Vec<Box<dyn BoxedConnectionTransport>>,
@@ -45,6 +47,16 @@ impl Kindling {
     }
 
     pub fn with_fronted_tls<R>(self, dialer: FrontedTlsDialer<R>) -> Self
+    where
+        R: FrontResolver + 'static,
+    {
+        self.with_transport(dialer)
+    }
+
+    /// Register a non-fronted direct h2 request-stream transport (the unfronted sibling of
+    /// [`with_fronted_meek`](Self::with_fronted_meek)) so the race can prefer a direct origin dial
+    /// where the network is open and fall back to the fronted transports where it is blocked.
+    pub fn with_direct_h2<R>(self, dialer: DirectH2Dialer<R>) -> Self
     where
         R: FrontResolver + 'static,
     {
@@ -126,6 +138,13 @@ impl Kindling {
     }
 
     pub fn push_fronted_tls<R>(&mut self, dialer: FrontedTlsDialer<R>)
+    where
+        R: FrontResolver + 'static,
+    {
+        self.push_transport(dialer);
+    }
+
+    pub fn push_direct_h2<R>(&mut self, dialer: DirectH2Dialer<R>)
     where
         R: FrontResolver + 'static,
     {
@@ -319,5 +338,23 @@ providers:
             .unwrap();
 
         assert_eq!(kindling.transport_count(), 1);
+    }
+
+    #[test]
+    fn kindling_registers_direct_h2_with_default_dns() {
+        let kindling = Kindling::new().with_direct_h2(DirectH2Dialer::with_default_dns("wifi"));
+
+        assert_eq!(kindling.transport_count(), 1);
+    }
+
+    #[test]
+    fn kindling_races_direct_h2_against_fronted_meek() {
+        // The intended bootstrap shape: a direct origin dial raced against a fronted meek transport.
+        let kindling = Kindling::new()
+            .with_direct_h2(DirectH2Dialer::with_default_dns("wifi"))
+            .with_fronted_meek_yaml(fronted_yaml(), "", "wifi")
+            .unwrap();
+
+        assert_eq!(kindling.transport_count(), 2);
     }
 }
