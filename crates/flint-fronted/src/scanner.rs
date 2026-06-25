@@ -56,7 +56,9 @@ impl Candidate {
     pub fn to_front(&self) -> Front {
         Front {
             provider: self.provider.clone(),
-            domain: self.fronted_host.clone(),
+            // The edge's canonical domain (for Akamai the verify hostname, e.g.
+            // a248.e.akamai.net) — not the inner fronted_host, which is separate.
+            domain: self.verify_hostname.clone(),
             endpoint: FrontEndpoint::Ip(self.addr),
             sni: self.sni.clone(),
             fronted_host: self.fronted_host.clone(),

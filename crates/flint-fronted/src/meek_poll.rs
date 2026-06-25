@@ -478,6 +478,14 @@ mod h1_backend {
                     }
                     break;
                 }
+                // The chunk size is attacker-controlled; cap the allocation. The
+                // server caps responses at the advertised max-body, so a single
+                // chunk larger than that is a protocol violation, not a huge body.
+                if size > cap {
+                    return Err(io::Error::other(format!(
+                        "meek: chunk size {size} exceeds max_body_bytes {cap}"
+                    )));
+                }
                 let mut chunk = vec![0u8; size];
                 self.stream.read_exact(&mut chunk).await?;
                 let mut crlf = [0u8; 2]; // consume + validate the chunk's trailing CRLF
