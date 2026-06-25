@@ -35,8 +35,8 @@ pub use flint_transport::{
 
 pub mod meek_poll;
 pub use meek_poll::{
-    open_meek_poll, FrontedMeekPollDialer, MeekHttpVersion, MeekPollConfig, MeekPollConn,
-    DEFAULT_MAX_BODY_BYTES,
+    open_meek_poll, open_meek_poll_auto, FrontedMeekPollDialer, MeekHttpVersion, MeekPollConfig,
+    MeekPollConn, DEFAULT_MAX_BODY_BYTES,
 };
 
 pub mod sys_dns;
@@ -1507,6 +1507,20 @@ pub async fn dial_fronts(
 ) -> Result<FrontedConnection, Error> {
     race_materialized_with(host, fronts, options, |strategy| async move {
         flint_dial::dial(&strategy).await
+    })
+    .await
+}
+
+/// Like [`dial_fronts`], but each dial returns an [`flint_dial::AlpnStream`] so the
+/// caller can read the ALPN the winning edge negotiated (h2 vs http/1.1) — used by
+/// the meek client to auto-select its HTTP version per connection.
+pub async fn dial_fronts_alpn(
+    host: &str,
+    fronts: &[MaterializedFront],
+    options: DialOptions,
+) -> Result<FrontedConnection<flint_dial::AlpnStream>, Error> {
+    race_materialized_with(host, fronts, options, |strategy| async move {
+        flint_dial::dial_alpn(&strategy).await
     })
     .await
 }

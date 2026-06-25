@@ -591,6 +591,22 @@ where
     MeekPollConn::connect(conn.stream, meek)
 }
 
+/// Like [`open_meek_poll`], but **auto-selects the HTTP version from the ALPN** the
+/// front negotiated: h2 if the edge picked `h2`, else h1. Pair with
+/// [`crate::dial_fronts_alpn`] so the meek client speaks whatever the CDN chose,
+/// instead of a fixed guess. Any `meek.http_version` is overridden.
+pub fn open_meek_poll_auto(
+    conn: crate::FrontedConnection<flint_dial::AlpnStream>,
+    mut meek: MeekPollConfig,
+) -> io::Result<MeekPollConn> {
+    meek.http_version = if conn.stream.alpn() == Some(b"h2".as_slice()) {
+        MeekHttpVersion::H2
+    } else {
+        MeekHttpVersion::H1
+    };
+    open_meek_poll(conn, meek)
+}
+
 fn random_session_id(len: usize) -> io::Result<String> {
     let mut raw = vec![0u8; len];
     ring::rand::SystemRandom::new()
