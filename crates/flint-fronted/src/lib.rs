@@ -687,38 +687,38 @@ impl<R: FrontResolver> DirectH2Dialer<R> {
             })
             .collect();
         let timeout = self.dial_options.attempt_timeout;
-        let tls = match flint_dial::race_windowed(strategies.len(), self.dial_options.window, |i| {
+        // Race the *full* direct-h2 connection per candidate, not just TLS: a candidate wins only once
+        // its MeekStream is open, so a fast TLS handshake that then fails h2 negotiation/request does
+        // not sink the whole dial — the remaining resolved addresses still get a turn.
+        match flint_dial::race_windowed(strategies.len(), self.dial_options.window, |i| {
             let strategy = strategies[i].clone();
             let fut = dial_one(strategy);
+            let host = host.clone();
+            let meek_options = self.meek_options.clone();
             async move {
+                let connect = async move {
+                    let tls = fut.await?;
+                    h2_request_stream(tls, &host, meek_options).await
+                };
                 match timeout {
-                    Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-                        Ok(result) => result,
-                        Err(_) => Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "direct dial attempt timed out",
-                        )),
-                    },
-                    None => fut.await,
+                    Some(timeout) => tokio::time::timeout(timeout, connect)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "direct dial attempt timed out")
+                        })
+                        .and_then(|result| result),
+                    None => connect.await,
                 }
             }
         })
         .await
         {
-            Ok((_, stream)) => stream,
-            Err(errors) => {
-                return Err(Error::DialFailed {
-                    tried: strategies.len(),
-                    errors: join_errors(errors),
-                })
-            }
-        };
-        h2_request_stream(tls, &host, self.meek_options.clone())
-            .await
-            .map_err(|source| Error::StreamOpen {
-                fronted_host: host,
-                source,
-            })
+            Ok((_, stream)) => Ok(stream),
+            Err(errors) => Err(Error::DialFailed {
+                tried: strategies.len(),
+                errors: join_errors(errors),
+            }),
+        }
     }
 }
 
