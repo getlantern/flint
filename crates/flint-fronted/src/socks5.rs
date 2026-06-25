@@ -160,9 +160,12 @@ mod tests {
     async fn socks5_connect_ip_then_tunnels() {
         let (mut client, server) = tokio::io::duplex(4096);
         tokio::spawn(mock_socks5(server));
-        connect(&mut client, &Target::Ip("93.184.216.34:80".parse().unwrap()))
-            .await
-            .expect("connect");
+        connect(
+            &mut client,
+            &Target::Ip("93.184.216.34:80".parse().unwrap()),
+        )
+        .await
+        .expect("connect");
         client.write_all(b"GET /").await.unwrap();
         let mut out = [0u8; 5];
         client.read_exact(&mut out).await.unwrap();

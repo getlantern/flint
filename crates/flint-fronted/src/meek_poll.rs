@@ -38,6 +38,9 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_POLL_RETRIES: u32 = 4;
 const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_SESSION_ID_LEN: usize = 16;
+/// Per-poll request timeout. A lost/stalled response must not block forever, or
+/// the retry path never runs; an elapsed request becomes a retryable error.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// In-memory pipe buffer between the app and the poll task (per direction).
 const PIPE_BUF: usize = 1 << 20; // 1 MiB
 
@@ -45,11 +48,11 @@ const HEADER_SESSION_ID: &str = "x-session-id";
 const HEADER_SEQ: &str = "x-meek-seq";
 const HEADER_MAX_BODY: &str = "x-meek-max-body";
 
-/// Which HTTP version to speak to the front. `flint_dial::TlsStream` does not
-/// expose negotiated ALPN, so the caller chooses: the live Akamai/CloudFront/
-/// Aliyun edges all negotiate h2 with a Chrome ALPN, so [`MeekHttpVersion::H2`]
-/// is the default; [`MeekHttpVersion::H1`] is for edges/origins that only do
-/// HTTP/1.1.
+/// Which HTTP version to speak to the front. Prefer letting the caller
+/// auto-select from the negotiated ALPN via [`crate::open_meek_poll_auto`] +
+/// [`crate::dial_fronts_alpn`] (the boring Chrome dial offers `h2,http/1.1` and
+/// the edge picks — e.g. the deployed Akamai meek endpoint negotiates h1). This
+/// enum is for the cases that force a version explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeekHttpVersion {
     H1,
@@ -74,6 +77,9 @@ pub struct MeekPollConfig {
     pub max_body_bytes: usize,
     pub max_poll_retries: u32,
     pub session_id_len: usize,
+    /// Per-poll request timeout; an elapsed request is a retryable error so a
+    /// stalled response can't block the session forever.
+    pub request_timeout: Duration,
 }
 
 impl MeekPollConfig {
@@ -86,6 +92,7 @@ impl MeekPollConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_poll_retries: DEFAULT_MAX_POLL_RETRIES,
             session_id_len: DEFAULT_SESSION_ID_LEN,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -104,6 +111,9 @@ impl MeekPollConfig {
         if self.session_id_len == 0 {
             self.session_id_len = DEFAULT_SESSION_ID_LEN;
         }
+        if self.request_timeout.is_zero() {
+            self.request_timeout = DEFAULT_REQUEST_TIMEOUT;
+        }
         self
     }
 }
@@ -113,7 +123,16 @@ impl MeekPollConfig {
 /// the poll task stops once the app side is gone.
 pub struct MeekPollConn {
     inner: DuplexStream,
-    _task: JoinHandle<()>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for MeekPollConn {
+    fn drop(&mut self) {
+        // Stop the poll task rather than detaching it: if it's parked in an HTTP
+        // roundtrip, the task (and the fronted connection it holds) must not
+        // outlive the conn.
+        self.task.abort();
+    }
 }
 
 impl MeekPollConn {
@@ -125,6 +144,14 @@ impl MeekPollConn {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let cfg = cfg.normalized();
+        // The h1 backend writes the request line + headers by hand, so a CR/LF (or
+        // other control char) in the host/path could split the request or inject
+        // headers. Reject up front (h2 also rejects these in header values).
+        if has_control_char(&cfg.inner_host) || has_control_char(&cfg.path) {
+            return Err(io::Error::other(
+                "meek: inner_host/path contains control characters",
+            ));
+        }
         let session_id = random_session_id(cfg.session_id_len)?;
         let (app_side, task_side) = duplex(PIPE_BUF);
         let task = tokio::spawn(async move {
@@ -134,7 +161,7 @@ impl MeekPollConn {
         });
         Ok(Self {
             inner: app_side,
-            _task: task,
+            task,
         })
     }
 }
@@ -198,7 +225,7 @@ where
                 }
                 Ok(Ok(n)) => Bytes::copy_from_slice(&read_buf[..n]),
                 Ok(Err(_)) => return Ok(()), // app gone
-                Err(_) => Bytes::new(),       // interval elapsed: poll-only
+                Err(_) => Bytes::new(),      // interval elapsed: poll-only
             }
         } else {
             tokio::time::sleep(cfg.poll_interval).await;
@@ -227,19 +254,35 @@ async fn roundtrip_with_retry(
         if attempt > 0 {
             tokio::time::sleep(RETRY_BASE_BACKOFF * attempt).await;
         }
-        match backend.roundtrip(cfg, session_id, seq, body.clone()).await {
+        // Bound each poll: a stalled response must not block forever, or the retry
+        // path never runs. An elapsed request is a retryable error.
+        let outcome = match tokio::time::timeout(
+            cfg.request_timeout,
+            backend.roundtrip(cfg, session_id, seq, body.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "meek: poll request timed out",
+            )),
+        };
+        match outcome {
             Ok(resp) => return Ok(resp),
             Err(err) => {
-                if attempt >= cfg.max_poll_retries {
+                // Retry only when it's safe to re-send on the same connection: h2
+                // opens a fresh multiplexed stream and the server dedupes the seq,
+                // so a lost request/response replays with no gap or duplication
+                // (see the retry-integrity tests). h1 has a single keep-alive
+                // connection that a failed/timed-out request leaves desynced, so a
+                // failure there ends the session and the caller re-dials a fresh
+                // front. (`reconnect` was a no-op and is gone.)
+                if attempt >= cfg.max_poll_retries || !backend.can_retry_in_place() {
                     return Err(io::Error::other(format!(
-                        "meek: poll failed after {} retries: {err}",
-                        cfg.max_poll_retries
+                        "meek: poll failed (attempt {}): {err}",
+                        attempt + 1
                     )));
-                }
-                // Re-establish the HTTP backend for the next attempt: an h2
-                // connection error poisons every future request on it.
-                if let Err(reconnect) = backend.reconnect(cfg).await {
-                    tracing::debug!(error = %reconnect, "meek backend reconnect failed");
                 }
                 attempt += 1;
             }
@@ -266,12 +309,12 @@ impl Backend {
         }
     }
 
-    /// Re-establish the connection in place. The h2 backend can't redial the
-    /// underlying TLS (it doesn't own a dialer), so this is a no-op for it; the
-    /// caller surfaces the original error after retries. A future fronted dialer
-    /// integration will replace this with a real redial.
-    async fn reconnect(&mut self, _cfg: &MeekPollConfig) -> io::Result<()> {
-        Ok(())
+    /// Whether a failed roundtrip can be safely retried on this same backend.
+    /// True for h2 (a fresh multiplexed stream + server seq-dedupe makes a re-send
+    /// idempotent); false for h1 (a single keep-alive connection that a
+    /// failed/timed-out request leaves desynced — the session must end instead).
+    fn can_retry_in_place(&self) -> bool {
+        matches!(self, Backend::H2(_))
     }
 
     async fn roundtrip(
@@ -381,11 +424,25 @@ mod h1_backend {
                 return Err(io::Error::other(format!("meek: status {status}")));
             }
 
-            // Body: Content-Length, or chunked.
+            // Body: Content-Length or chunked. The whole body MUST be consumed so
+            // the next poll's response stays framed on this keep-alive connection.
             if chunked {
                 self.read_chunked(cfg.max_body_bytes).await
             } else {
-                let n = content_length.unwrap_or(0).min(cfg.max_body_bytes);
+                // A keep-alive response with neither Content-Length nor chunked
+                // has no frame boundary — reject rather than desync the next read.
+                let n = content_length.ok_or_else(|| {
+                    io::Error::other("meek: h1 response missing Content-Length on keep-alive")
+                })?;
+                // The server caps responses at the advertised max-body, so an
+                // over-cap body is a protocol violation; error rather than leave
+                // unread bytes that would desync the next response.
+                if n > cfg.max_body_bytes {
+                    return Err(io::Error::other(format!(
+                        "meek: h1 response body {n} exceeds max_body_bytes {}",
+                        cfg.max_body_bytes
+                    )));
+                }
                 let mut buf = vec![0u8; n];
                 self.stream.read_exact(&mut buf).await?;
                 Ok(buf)
@@ -402,21 +459,34 @@ mod h1_backend {
                         "meek: h1 eof in chunk size",
                     ));
                 }
-                let size = usize::from_str_radix(size_line.trim(), 16)
+                // The chunk size is the hex token before any `;chunk-extension`.
+                let token = size_line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(token, 16)
                     .map_err(|_| io::Error::other(format!("meek: bad chunk size {size_line:?}")))?;
                 if size == 0 {
-                    // Trailing CRLF (and any trailers) — read the final blank line.
-                    let mut trailer = String::new();
-                    let _ = self.stream.read_line(&mut trailer).await?;
+                    // Drain trailer lines through the terminating blank line so the
+                    // connection stays framed for the next response.
+                    loop {
+                        let mut trailer = String::new();
+                        if self.stream.read_line(&mut trailer).await? == 0 {
+                            break;
+                        }
+                        if trailer.trim_end_matches(['\r', '\n']).is_empty() {
+                            break;
+                        }
+                    }
                     break;
                 }
                 let mut chunk = vec![0u8; size];
                 self.stream.read_exact(&mut chunk).await?;
                 let mut crlf = [0u8; 2]; // consume the chunk's trailing CRLF
                 self.stream.read_exact(&mut crlf).await?;
-                out.extend_from_slice(&chunk);
-                if out.len() >= cap {
-                    break;
+                // Stop *appending* past the cap, but keep draining the framing to
+                // the terminating 0-size chunk so the keep-alive connection stays
+                // aligned for the next response.
+                if out.len() < cap {
+                    let room = cap - out.len();
+                    out.extend_from_slice(&chunk[..chunk.len().min(room)]);
                 }
             }
             Ok(out)
@@ -501,10 +571,13 @@ mod h2_backend {
                 recv.flow_control()
                     .release_capacity(chunk.len())
                     .map_err(to_io)?;
-                out.extend_from_slice(&chunk);
-                if out.len() >= cfg.max_body_bytes {
-                    break;
+                // The server caps responses at the advertised max-body; an over-cap
+                // body is a protocol violation. Error rather than silently truncate
+                // and advance the seq past data the app never received.
+                if out.len() + chunk.len() > cfg.max_body_bytes {
+                    return Err(io::Error::other("meek: h2 response exceeds max_body_bytes"));
                 }
+                out.extend_from_slice(&chunk);
             }
             Ok(out)
         }
@@ -605,6 +678,12 @@ pub fn open_meek_poll_auto(
         MeekHttpVersion::H1
     };
     open_meek_poll(conn, meek)
+}
+
+/// True if `s` contains an ASCII control char (incl. CR/LF) — these can split a
+/// hand-built HTTP/1.1 request or inject headers, so the meek host/path reject them.
+fn has_control_char(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 fn random_session_id(len: usize) -> io::Result<String> {

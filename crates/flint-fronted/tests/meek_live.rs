@@ -52,12 +52,22 @@ async fn meek_live_auto_alpn_through_akamai_to_example_com() {
     let mut meek = open_meek_poll_auto(conn, MeekPollConfig::new(MEEK_HOST)).expect("open meek");
 
     // The meek-server's upstream is microsocks (SOCKS5); CONNECT to example.com.
-    socks5::connect(&mut meek, &Target::Domain("example.com".into(), 80))
-        .await
-        .expect("socks5 connect");
-    meek.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-        .await
-        .expect("write request");
+    // Bound the SOCKS5 handshake + request write too, so a stall in microsocks or
+    // the tunnel can't hang the test until the outer runner kills it.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        socks5::connect(&mut meek, &Target::Domain("example.com".into(), 80)),
+    )
+    .await
+    .expect("socks5 connect timed out")
+    .expect("socks5 connect");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        meek.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"),
+    )
+    .await
+    .expect("request write timed out")
+    .expect("write request");
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];

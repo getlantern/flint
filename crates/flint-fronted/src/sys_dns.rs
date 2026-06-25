@@ -14,7 +14,14 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use async_trait::async_trait;
 
+use std::time::Duration;
+
 use crate::FrontResolver;
+
+/// Cap on a single `getaddrinfo` call. A stuck OS resolver must not hang the whole
+/// scan/dial path; on timeout the blocking thread is left to finish on its own
+/// (best-effort) and the lookup returns an error so the scan moves on.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolves hostnames through the OS/ISP resolver (`getaddrinfo`). IP literals
 /// pass through unchanged.
@@ -33,14 +40,21 @@ impl FrontResolver for SystemResolver {
         // `getaddrinfo` is blocking; keep it off the async runtime. Port 0 is a
         // placeholder — only the resolved IPs are kept.
         let host = host.to_owned();
-        let addrs = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             (host.as_str(), 0u16)
                 .to_socket_addrs()
                 .map(|it| it.map(|sa| sa.ip()).collect::<Vec<IpAddr>>())
-        })
-        .await
-        .map_err(io::Error::other)??;
-        Ok(addrs)
+        });
+        // Bound the lookup: a hung resolver shouldn't stall the scan. Dropping the
+        // handle on timeout detaches the blocking thread (it can't be aborted), so
+        // it finishes harmlessly in the background.
+        match tokio::time::timeout(RESOLVE_TIMEOUT, handle).await {
+            Ok(joined) => joined.map_err(io::Error::other)?,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "system resolver timed out",
+            )),
+        }
     }
 }
 

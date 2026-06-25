@@ -31,8 +31,11 @@ use crate::{Front, FrontEndpoint, FrontResolver};
 /// Canonical Akamai edge hostnames. The first is the universal one; the rest are
 /// commonly-reachable alternates (also the SNIs `cdn-ip-finder` ships). Resolving
 /// these through the system resolver yields geo-local edge IPs.
-pub const DEFAULT_AKAMAI_EDGE_HOSTS: &[&str] =
-    &["a248.e.akamai.net", "a77.net.akamai.net", "ds-aksb.akamaized.net"];
+pub const DEFAULT_AKAMAI_EDGE_HOSTS: &[&str] = &[
+    "a248.e.akamai.net",
+    "a77.net.akamai.net",
+    "ds-aksb.akamaized.net",
+];
 
 /// A scan candidate: one edge IP plus how to front through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,11 +278,7 @@ pub struct ScanResult {
 ///
 /// The probe is injected so this is testable without boring/network; production
 /// passes a closure that dials the candidate's [`Front`] and issues an HTTP probe.
-pub async fn scan<P, Fut>(
-    candidates: Vec<Candidate>,
-    window: usize,
-    probe: P,
-) -> Vec<ScanResult>
+pub async fn scan<P, Fut>(candidates: Vec<Candidate>, window: usize, probe: P) -> Vec<ScanResult>
 where
     P: Fn(Candidate) -> Fut,
     Fut: std::future::Future<Output = Option<Duration>> + 'static,
@@ -323,17 +322,50 @@ struct Prefix {
 fn cloudfront_prefixes() -> &'static [Prefix] {
     // base = u32 of the network address; bits = prefix length.
     const P: &[Prefix] = &[
-        Prefix { base: u32::from_be_bytes([13, 32, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([13, 224, 0, 0]), bits: 14 },
-        Prefix { base: u32::from_be_bytes([52, 84, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([52, 222, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([54, 182, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([54, 192, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([54, 230, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([54, 239, 128, 0]), bits: 18 },
-        Prefix { base: u32::from_be_bytes([99, 84, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([143, 204, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([205, 251, 192, 0]), bits: 19 },
+        Prefix {
+            base: u32::from_be_bytes([13, 32, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([13, 224, 0, 0]),
+            bits: 14,
+        },
+        Prefix {
+            base: u32::from_be_bytes([52, 84, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([52, 222, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([54, 182, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([54, 192, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([54, 230, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([54, 239, 128, 0]),
+            bits: 18,
+        },
+        Prefix {
+            base: u32::from_be_bytes([99, 84, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([143, 204, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([205, 251, 192, 0]),
+            bits: 19,
+        },
     ];
     P
 }
@@ -345,18 +377,54 @@ fn cloudfront_prefixes() -> &'static [Prefix] {
 /// CDN-bearing ones) as needed.
 fn aliyun_prefixes() -> &'static [Prefix] {
     const P: &[Prefix] = &[
-        Prefix { base: u32::from_be_bytes([8, 208, 0, 0]), bits: 13 },
-        Prefix { base: u32::from_be_bytes([47, 52, 0, 0]), bits: 14 },
-        Prefix { base: u32::from_be_bytes([47, 74, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([47, 88, 0, 0]), bits: 14 },
-        Prefix { base: u32::from_be_bytes([47, 235, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([47, 236, 0, 0]), bits: 14 },
-        Prefix { base: u32::from_be_bytes([47, 240, 0, 0]), bits: 14 },
-        Prefix { base: u32::from_be_bytes([47, 244, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([47, 246, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([47, 250, 0, 0]), bits: 15 },
-        Prefix { base: u32::from_be_bytes([47, 254, 0, 0]), bits: 16 },
-        Prefix { base: u32::from_be_bytes([106, 11, 0, 0]), bits: 16 },
+        Prefix {
+            base: u32::from_be_bytes([8, 208, 0, 0]),
+            bits: 13,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 52, 0, 0]),
+            bits: 14,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 74, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 88, 0, 0]),
+            bits: 14,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 235, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 236, 0, 0]),
+            bits: 14,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 240, 0, 0]),
+            bits: 14,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 244, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 246, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 250, 0, 0]),
+            bits: 15,
+        },
+        Prefix {
+            base: u32::from_be_bytes([47, 254, 0, 0]),
+            bits: 16,
+        },
+        Prefix {
+            base: u32::from_be_bytes([106, 11, 0, 0]),
+            bits: 16,
+        },
     ];
     P
 }
@@ -412,8 +480,7 @@ mod tests {
         let resolver = MockResolver(map);
 
         let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
-        targets.akamai_edge_hosts =
-            vec!["a248.e.akamai.net".into(), "a77.net.akamai.net".into()];
+        targets.akamai_edge_hosts = vec!["a248.e.akamai.net".into(), "a77.net.akamai.net".into()];
         targets.akamai_decoy_snis = vec!["www.microsoft.com".into()];
 
         let cands = akamai_candidates(&resolver, &targets).await;
@@ -421,7 +488,9 @@ mod tests {
         assert_eq!(cands.len(), 4);
         // Empty-SNI variant present; cert always verifies against the edge host.
         assert!(cands.iter().any(|c| c.sni.is_empty()));
-        assert!(cands.iter().all(|c| c.verify_hostname == "a248.e.akamai.net"));
+        assert!(cands
+            .iter()
+            .all(|c| c.verify_hostname == "a248.e.akamai.net"));
         assert!(cands
             .iter()
             .all(|c| c.fronted_host == "meek.dsa.akamai.getiantem.org"));
