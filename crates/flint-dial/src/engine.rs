@@ -9,16 +9,22 @@ use flint_tls::{CertVerification, Profile};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::{BootstrapStrategy, BoxedTlsStream, TlsEngine};
+use crate::{AlpnStream, BootstrapStrategy, BoxedTlsStream, TlsEngine};
 
 /// Execute `strategy`: open a TCP connection to its target, then dial TLS over it ([`dial_over`]).
 /// Sets `TCP_NODELAY` when the wire plan asks for it (so each shaped segment leaves as its own packet).
 pub async fn dial(strategy: &BootstrapStrategy) -> io::Result<BoxedTlsStream> {
+    Ok(dial_alpn(strategy).await?.into_inner())
+}
+
+/// Like [`dial`], but returns an [`AlpnStream`] that also carries the ALPN protocol the server
+/// negotiated, so a consumer can pick its HTTP version per connection.
+pub async fn dial_alpn(strategy: &BootstrapStrategy) -> io::Result<AlpnStream> {
     let tcp = TcpStream::connect(strategy.target).await?;
     if strategy.wire.tcp_nodelay {
         let _ = tcp.set_nodelay(true);
     }
-    dial_over(tcp, strategy).await
+    dial_over_alpn(tcp, strategy).await
 }
 
 /// Execute `strategy` over an already-connected byte `stream` (the caller controls how the TCP is
@@ -28,16 +34,25 @@ pub async fn dial_over<S>(stream: S, strategy: &BootstrapStrategy) -> io::Result
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    Ok(dial_over_alpn(stream, strategy).await?.into_inner())
+}
+
+/// Like [`dial_over`], but returns an [`AlpnStream`] carrying the negotiated ALPN protocol.
+pub async fn dial_over_alpn<S>(stream: S, strategy: &BootstrapStrategy) -> io::Result<AlpnStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     match &strategy.engine {
         TlsEngine::BoringChrome(profile) => {
-            dial_boring(
+            let (stream, alpn) = dial_boring(
                 stream,
                 &strategy.sni,
                 profile,
                 &strategy.wire,
                 &strategy.verification,
             )
-            .await
+            .await?;
+            Ok(AlpnStream::new(stream, alpn))
         }
         TlsEngine::Rustls => {
             drop(stream);
@@ -70,12 +85,15 @@ async fn dial_boring<S>(
     profile: &Profile,
     wire: &WirePlan,
     verification: &CertVerification,
-) -> io::Result<BoxedTlsStream>
+) -> io::Result<(BoxedTlsStream, Option<Vec<u8>>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let tls = flint_tls::connect_with(shape(stream, wire), sni, profile, verification).await?;
-    Ok(Box::new(tls))
+    // Capture the ALPN the edge negotiated (the boring profile offers h2,http/1.1)
+    // before boxing erases the concrete SslStream.
+    let alpn = tls.ssl().selected_alpn_protocol().map(|p| p.to_vec());
+    Ok((Box::new(tls), alpn))
 }
 
 #[cfg(not(feature = "boring"))]
@@ -85,7 +103,7 @@ async fn dial_boring<S>(
     _profile: &Profile,
     _wire: &WirePlan,
     _verification: &CertVerification,
-) -> io::Result<BoxedTlsStream>
+) -> io::Result<(BoxedTlsStream, Option<Vec<u8>>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {

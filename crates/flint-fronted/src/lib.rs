@@ -32,6 +32,20 @@ pub use flint_transport::{
     race_boxed, BoxedConnection, BoxedConnectionTransport, Connection, ConnectionTransport,
     RaceError, RaceOptions, TransportConnection,
 };
+
+pub mod meek_poll;
+pub use meek_poll::{
+    open_meek_poll, open_meek_poll_auto, FrontedMeekPollDialer, MeekHttpVersion, MeekPollConfig,
+    MeekPollConn, DEFAULT_MAX_BODY_BYTES,
+};
+
+pub mod sys_dns;
+pub use sys_dns::SystemResolver;
+
+pub mod scanner;
+pub use scanner::{Candidate, ScanResult, ScanTargets};
+
+pub mod socks5;
 use http::{Method, Request, StatusCode};
 use ring::digest;
 use serde::{Deserialize, Serialize};
@@ -1479,6 +1493,36 @@ where
             errors: join_errors(errors),
         }),
     }
+}
+
+/// Race already-materialized fronts (e.g. scanner-discovered) to a working
+/// verified-TLS edge, dialing each with the boring Chrome engine. The scanner /
+/// self-bootstrap path uses this instead of [`FrontPool`] (which needs a
+/// [`Config`]). Requires the `boring` feature at runtime; without it each dial
+/// returns an Unsupported error and the race fails.
+pub async fn dial_fronts(
+    host: &str,
+    fronts: &[MaterializedFront],
+    options: DialOptions,
+) -> Result<FrontedConnection, Error> {
+    race_materialized_with(host, fronts, options, |strategy| async move {
+        flint_dial::dial(&strategy).await
+    })
+    .await
+}
+
+/// Like [`dial_fronts`], but each dial returns an [`flint_dial::AlpnStream`] so the
+/// caller can read the ALPN the winning edge negotiated (h2 vs http/1.1) — used by
+/// the meek client to auto-select its HTTP version per connection.
+pub async fn dial_fronts_alpn(
+    host: &str,
+    fronts: &[MaterializedFront],
+    options: DialOptions,
+) -> Result<FrontedConnection<flint_dial::AlpnStream>, Error> {
+    race_materialized_with(host, fronts, options, |strategy| async move {
+        flint_dial::dial_alpn(&strategy).await
+    })
+    .await
 }
 
 struct DialCandidate {
