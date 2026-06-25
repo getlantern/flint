@@ -144,11 +144,12 @@ impl MeekPollConn {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let cfg = cfg.normalized();
-        // The h1 backend writes the request line + headers by hand, so any
-        // CR/LF/control, space, or non-ASCII byte in the host/path could split the
-        // request, inject headers, or break request-target/Host tokenization.
-        // Reject up front (h2 also rejects these in header values).
-        if has_invalid_host_char(&cfg.inner_host) || has_invalid_host_char(&cfg.path) {
+        // The h1 backend writes the request line + headers by hand. inner_host
+        // must be a bare authority (host[:port]) — reject CR/LF/control, space,
+        // non-ASCII, and authority-breaking chars (`/?#@\`) that would split the
+        // request or produce an invalid Host. The path may contain `/?#`, so it
+        // only gets the control/space/non-ASCII check.
+        if invalid_inner_host(&cfg.inner_host) || has_invalid_host_char(&cfg.path) {
             return Err(io::Error::other(
                 "meek: inner_host/path contains invalid characters",
             ));
@@ -493,13 +494,16 @@ mod h1_backend {
                 if &crlf != b"\r\n" {
                     return Err(io::Error::other("meek: malformed chunk terminator"));
                 }
-                // Stop *appending* past the cap, but keep draining the framing to
-                // the terminating 0-size chunk so the keep-alive connection stays
-                // aligned for the next response.
-                if out.len() < cap {
-                    let room = cap - out.len();
-                    out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                // The server caps responses at the advertised max-body, so a total
+                // exceeding it is a protocol violation. Error (matching the
+                // non-chunked + h2 paths) rather than silently truncating and
+                // advancing the seq past data the app never received.
+                if out.len() + chunk.len() > cap {
+                    return Err(io::Error::other(
+                        "meek: chunked response exceeds max_body_bytes",
+                    ));
                 }
+                out.extend_from_slice(&chunk);
             }
             Ok(out)
         }
@@ -698,6 +702,16 @@ fn has_invalid_host_char(s: &str) -> bool {
     // Anything outside printable non-space ASCII (control incl. CR/LF, SPACE/DEL,
     // and non-ASCII) would break the hand-built h1 request line / Host header.
     s.bytes().any(|b| b <= 0x20 || b >= 0x7f)
+}
+
+/// inner_host must be a bare authority (`host[:port]`) — additionally reject the
+/// authority-breaking characters that don't belong in a Host header / request
+/// target (`/ ? # @ \`).
+fn invalid_inner_host(s: &str) -> bool {
+    s.is_empty()
+        || has_invalid_host_char(s)
+        || s.bytes()
+            .any(|b| matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\'))
 }
 
 fn random_session_id(len: usize) -> io::Result<String> {
