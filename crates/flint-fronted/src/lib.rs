@@ -566,6 +566,178 @@ where
     }
 }
 
+/// A non-fronted HTTP/2 request-stream transport: the unfronted sibling of [`FrontedMeekDialer`].
+///
+/// It resolves the origin host through a [`FrontResolver`], dials it directly with a Chrome TLS
+/// ClientHello (real SNI = the host, certificate verified against the host), opens one h2
+/// `{method} {path}` request to the origin, and exposes the request/response bodies as a
+/// [`MeekStream`]. Because it yields the same stream type and shape as [`FrontedMeekDialer`], a
+/// connection race (e.g. `flint-kindling`) can pit a direct origin dial against fronted transports
+/// with every transport presenting a uniform byte stream — the direct dial wins on an open network,
+/// the fronted transports win where it is blocked.
+///
+/// Trust defaults to the system roots; [`with_trusted_roots`](Self::with_trusted_roots) pins a
+/// specific root set (e.g. to match a fronted config's `trustedcas`, or for tests).
+#[derive(Debug, Clone)]
+pub struct DirectH2Dialer<R> {
+    resolver: R,
+    port: u16,
+    dial_options: DialOptions,
+    meek_options: MeekOptions,
+    trusted_roots: Arc<[String]>,
+}
+
+impl<R> DirectH2Dialer<R> {
+    /// Build a dialer over `resolver` (used to resolve the origin host to A/AAAA records). Defaults to
+    /// port 443, default [`DialOptions`], default [`MeekOptions`] (`POST /`, expecting `200`), and
+    /// system-root certificate verification.
+    pub fn new(resolver: R) -> Self {
+        Self {
+            resolver,
+            port: 443,
+            dial_options: DialOptions::default(),
+            meek_options: MeekOptions::default(),
+            trusted_roots: Arc::from(Vec::<String>::new()),
+        }
+    }
+
+    /// Override the origin port (default 443).
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Override the dial options (wire plan, race window, per-attempt timeout).
+    pub fn with_dial_options(mut self, options: DialOptions) -> Self {
+        self.dial_options = options;
+        self
+    }
+
+    /// Override the request framing (method, path, expected success status).
+    pub fn with_meek_options(mut self, options: MeekOptions) -> Self {
+        self.meek_options = options;
+        self
+    }
+
+    /// Pin the certificate trust roots (PEM). Empty (the default) means the system roots.
+    pub fn with_trusted_roots(mut self, roots: Vec<String>) -> Self {
+        self.trusted_roots = roots.into();
+        self
+    }
+
+    /// Borrow the resolver.
+    pub fn resolver(&self) -> &R {
+        &self.resolver
+    }
+}
+
+impl DirectH2Dialer<FlintDnsResolver> {
+    /// Build a dialer that resolves the origin host through the default un-poisoned DoH pool on
+    /// `network` (mirrors [`FrontedMeekDialer::with_default_dns`]).
+    pub fn with_default_dns(network: impl Into<String>) -> Self {
+        Self::new(FlintDnsResolver::default_pool(network))
+    }
+}
+
+impl<R: FrontResolver> DirectH2Dialer<R> {
+    /// Resolve `host`, dial it directly (racing the resolved addresses), and open an h2 request-stream
+    /// to `host` at the configured path. The TLS certificate is verified against `host`.
+    pub async fn connect_direct(&self, host: &str) -> Result<MeekStream, Error> {
+        self.connect_direct_with(
+            host,
+            |strategy| async move { flint_dial::dial(&strategy).await },
+        )
+        .await
+    }
+
+    /// [`connect_direct`](Self::connect_direct) with an injectable per-strategy dial step (the seam
+    /// tests use to substitute a local server for the real network dial).
+    pub async fn connect_direct_with<F, Fut, T>(
+        &self,
+        host: &str,
+        mut dial_one: F,
+    ) -> Result<MeekStream, Error>
+    where
+        F: FnMut(BootstrapStrategy) -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let host = strip_port(host).to_ascii_lowercase();
+        let ips = self
+            .resolver
+            .resolve(&host)
+            .await
+            .map_err(|source| Error::Resolve {
+                front: host.clone(),
+                source,
+            })?;
+        if ips.is_empty() {
+            return Err(Error::EmptyResolution { front: host });
+        }
+        let verification = CertVerification::Roots {
+            roots_pem: self.trusted_roots.clone(),
+            hostname: host.clone(),
+        };
+        let strategies: Vec<BootstrapStrategy> = ips
+            .into_iter()
+            .map(|ip| {
+                BootstrapStrategy::boring_chrome(SocketAddr::new(ip, self.port), host.clone())
+                    .with_wire(self.dial_options.wire.clone())
+                    .with_verification(verification.clone())
+            })
+            .collect();
+        let timeout = self.dial_options.attempt_timeout;
+        // Race the *full* direct-h2 connection per candidate, not just TLS: a candidate wins only once
+        // its MeekStream is open, so a fast TLS handshake that then fails h2 negotiation/request does
+        // not sink the whole dial — the remaining resolved addresses still get a turn.
+        match flint_dial::race_windowed(strategies.len(), self.dial_options.window, |i| {
+            let strategy = strategies[i].clone();
+            let fut = dial_one(strategy);
+            let host = host.clone();
+            let meek_options = self.meek_options.clone();
+            async move {
+                let connect = async move {
+                    let tls = fut.await?;
+                    h2_request_stream(tls, &host, meek_options).await
+                };
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, connect)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "direct dial attempt timed out")
+                        })
+                        .and_then(|result| result),
+                    None => connect.await,
+                }
+            }
+        })
+        .await
+        {
+            Ok((_, stream)) => Ok(stream),
+            Err(errors) => Err(Error::DialFailed {
+                tried: strategies.len(),
+                errors: join_errors(errors),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl<R> ConnectionTransport for DirectH2Dialer<R>
+where
+    R: FrontResolver,
+{
+    type Stream = MeekStream;
+
+    fn name(&self) -> &str {
+        "direct-h2"
+    }
+
+    async fn connect(&self, host: &str) -> io::Result<Self::Stream> {
+        self.connect_direct(host).await.map_err(io::Error::other)
+    }
+}
+
 impl AsyncRead for MeekStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -2018,6 +2190,87 @@ providers:
         conn.stream.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"pong");
         assert_eq!(seen_rx.await.unwrap(), Some("cover.example".into()));
+    }
+
+    #[test]
+    fn direct_h2_dialer_builds_with_default_dns_and_names_itself() {
+        let dialer = DirectH2Dialer::with_default_dns("wifi").with_meek_options(MeekOptions {
+            path: "/api/v1/config-new".into(),
+            ..Default::default()
+        });
+        assert_eq!(ConnectionTransport::name(&dialer), "direct-h2");
+    }
+
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn direct_h2_dialer_round_trips_over_origin_with_real_sni() {
+        // The unfronted sibling of the meek round-trip: dial the origin directly with the *real* SNI,
+        // open an h2 POST to the origin host, and round-trip a body. The cert is verified against the
+        // pinned test roots, so this exercises the full TLS + h2 request-stream path.
+        let ca = test_ca();
+        let resolver = StaticResolver(vec!["198.51.100.20".parse().unwrap()]);
+        let dialer = DirectH2Dialer::new(resolver)
+            .with_dial_options(DialOptions {
+                window: 1,
+                attempt_timeout: None,
+                ..Default::default()
+            })
+            .with_meek_options(MeekOptions {
+                path: "/api/v1/config-new".into(),
+                ..Default::default()
+            })
+            .with_trusted_roots(vec![ca.pem.clone()]);
+        let acceptor = std::sync::Arc::new(server_acceptor(&ca, "df.iantem.io"));
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+
+        let mut stream = dialer
+            .connect_direct_with("df.iantem.io", move |strategy| {
+                let acceptor = acceptor.clone();
+                let seen_tx = seen_tx.lock().unwrap().take();
+                async move {
+                    let (client, server) = tokio::io::duplex(128 * 1024);
+                    tokio::spawn(async move {
+                        let tls = tokio_boring2::accept(&acceptor, server).await.unwrap();
+                        let seen = tls
+                            .ssl()
+                            .servername(NameType::HOST_NAME)
+                            .map(ToOwned::to_owned);
+                        if let Some(tx) = seen_tx {
+                            let _ = tx.send(seen);
+                        }
+                        let mut h2 = h2::server::handshake(tls).await.unwrap();
+                        let accepted = h2.accept().await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let (request, mut respond) = accepted;
+                            assert_eq!(request.method(), Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/config-new");
+                            assert_eq!(request.headers()[http::header::HOST], "df.iantem.io");
+                            let mut send = respond
+                                .send_response(
+                                    Response::builder().status(200).body(()).unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                            let mut body = request.into_body();
+                            let chunk = body.data().await.unwrap().unwrap();
+                            assert_eq!(&chunk[..], b"ping");
+                            send.send_data(Bytes::from_static(b"pong"), true).unwrap();
+                        });
+                        while h2.accept().await.is_some() {}
+                    });
+                    flint_dial::dial_over(client, &strategy).await
+                }
+            })
+            .await
+            .unwrap();
+
+        stream.write_all(b"ping").await.unwrap();
+        let mut out = [0; 4];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"pong");
+        // Direct dial presents the real origin SNI, not a decoy front.
+        assert_eq!(seen_rx.await.unwrap(), Some("df.iantem.io".into()));
     }
 
     #[tokio::test]
