@@ -86,9 +86,18 @@ pub struct ScanTargets {
     pub akamai_decoy_snis: Vec<String>,
     /// Sample this many CloudFront IPs from the embedded prefix list (0 = skip).
     pub cloudfront_samples: usize,
+    /// Cert hostname CloudFront candidates verify against (empty SNI ⇒ the edge
+    /// presents its default cert, NOT one for the inner host). `None` falls back to
+    /// `fronted_host`, which only verifies if the meek endpoint's CloudFront
+    /// distribution serves a cert valid for it — set this to the edge cert identity
+    /// (e.g. a `*.cloudfront.net` name) for a real CloudFront deployment.
+    pub cloudfront_verify_hostname: Option<String>,
     /// Sample this many Alibaba Cloud (Aliyun) CDN IPs from the embedded prefix
     /// list (0 = skip).
     pub aliyun_samples: usize,
+    /// Cert hostname Aliyun candidates verify against; see
+    /// [`Self::cloudfront_verify_hostname`]. `None` falls back to `fronted_host`.
+    pub aliyun_verify_hostname: Option<String>,
     /// Aliyun edge hostnames to also resolve via the system resolver (in addition
     /// to prefix sampling; empty = none).
     pub aliyun_edge_hosts: Vec<String>,
@@ -108,7 +117,9 @@ impl ScanTargets {
             akamai_verify_hostname: "a248.e.akamai.net".into(),
             akamai_decoy_snis: Vec::new(),
             cloudfront_samples: 16,
+            cloudfront_verify_hostname: None,
             aliyun_samples: 16,
+            aliyun_verify_hostname: None,
             aliyun_edge_hosts: Vec::new(),
             port: 443,
         }
@@ -149,32 +160,42 @@ pub async fn akamai_candidates<R: FrontResolver>(
 }
 
 /// Sample CloudFront edge IPs from the embedded prefix list and build empty-SNI
-/// candidates. The inner host doubles as the cert verify hostname (CloudFront
-/// serves its default `*.cloudfront.net`-style cert on cross-distribution Host
-/// routing).
+/// candidates. With empty SNI the edge presents its own default cert, so the
+/// verify hostname is `cloudfront_verify_hostname` if set, else `fronted_host`
+/// (see that field's docs — `fronted_host` only verifies for a CloudFront meek
+/// deployment whose cert covers it).
 pub fn cloudfront_candidates(targets: &ScanTargets, seed: u64) -> Vec<Candidate> {
     sample_prefix_candidates(
         "cloudfront",
         cloudfront_prefixes(),
         targets,
         targets.cloudfront_samples,
+        targets
+            .cloudfront_verify_hostname
+            .as_deref()
+            .unwrap_or(&targets.fronted_host),
         seed,
     )
 }
 
 /// Sample Alibaba Cloud (Aliyun) CDN edge IPs from the embedded prefix list,
 /// plus resolve any configured Aliyun edge hostnames via the system resolver.
-/// Empty SNI; cert verified against the inner host.
+/// Empty SNI; verify hostname is `aliyun_verify_hostname` if set, else `fronted_host`.
 pub async fn aliyun_candidates<R: FrontResolver>(
     resolver: &R,
     targets: &ScanTargets,
     seed: u64,
 ) -> Vec<Candidate> {
+    let verify = targets
+        .aliyun_verify_hostname
+        .as_deref()
+        .unwrap_or(&targets.fronted_host);
     let mut out = sample_prefix_candidates(
         "aliyun",
         aliyun_prefixes(),
         targets,
         targets.aliyun_samples,
+        verify,
         seed,
     );
     let mut ips: BTreeSet<IpAddr> = BTreeSet::new();
@@ -188,7 +209,7 @@ pub async fn aliyun_candidates<R: FrontResolver>(
             provider: "aliyun".into(),
             addr: SocketAddr::new(ip, targets.port),
             sni: String::new(),
-            verify_hostname: targets.fronted_host.clone(),
+            verify_hostname: verify.to_string(),
             fronted_host: targets.fronted_host.clone(),
         });
     }
@@ -196,13 +217,14 @@ pub async fn aliyun_candidates<R: FrontResolver>(
 }
 
 /// Weighted sampling of `samples` IPs from `prefixes` (a /14 is more likely than
-/// a /22), building empty-SNI candidates for `provider`. Deterministic for a
-/// given seed (seedable for tests). The inner host is the cert verify hostname.
+/// a /22), building empty-SNI candidates for `provider`, verified against
+/// `verify_hostname`. Deterministic for a given seed (seedable for tests).
 fn sample_prefix_candidates(
     provider: &str,
     prefixes: &[Prefix],
     targets: &ScanTargets,
     samples: usize,
+    verify_hostname: &str,
     seed: u64,
 ) -> Vec<Candidate> {
     if samples == 0 || prefixes.is_empty() {
@@ -246,7 +268,7 @@ fn sample_prefix_candidates(
             provider: provider.to_string(),
             addr: SocketAddr::new(IpAddr::V4(ip), targets.port),
             sni: String::new(),
-            verify_hostname: targets.fronted_host.clone(),
+            verify_hostname: verify_hostname.to_string(),
             fronted_host: targets.fronted_host.clone(),
         });
     }
@@ -531,8 +553,10 @@ mod tests {
     fn aliyun_sampling_is_deterministic_and_in_range() {
         let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
         targets.aliyun_samples = 12;
-        let a = sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, 99);
-        let b = sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, 99);
+        let a =
+            sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, "verify.test", 99);
+        let b =
+            sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, "verify.test", 99);
         assert_eq!(a, b);
         assert_eq!(a.len(), 12);
         for c in &a {

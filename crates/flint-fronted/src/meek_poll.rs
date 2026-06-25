@@ -518,6 +518,15 @@ mod h2_backend {
 
     pub struct H2Backend {
         send_request: SendRequest<Bytes>,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for H2Backend {
+        fn drop(&mut self) {
+            // Tear down the connection driver with the backend, or it (and the TLS
+            // stream it holds) leaks after the conn is dropped/aborted.
+            self.driver.abort();
+        }
     }
 
     impl H2Backend {
@@ -527,11 +536,14 @@ mod h2_backend {
         {
             let (send_request, connection) = h2::client::handshake(stream).await.map_err(to_io)?;
             // Drive the h2 connection; it must be polled for requests to make
-            // progress. Aborted when the backend (and this task handle) drop.
-            tokio::spawn(async move {
+            // progress. Held + aborted on Drop so it can't outlive the backend.
+            let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            Ok(Self { send_request })
+            Ok(Self {
+                send_request,
+                driver,
+            })
         }
 
         pub async fn roundtrip(
