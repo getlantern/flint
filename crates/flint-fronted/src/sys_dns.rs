@@ -37,6 +37,10 @@ impl SystemResolver {
 #[async_trait]
 impl FrontResolver for SystemResolver {
     async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        // Fast path: an IP literal needs no lookup (and no blocking task).
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
         // `getaddrinfo` is blocking; keep it off the async runtime. Port 0 is a
         // placeholder — only the resolved IPs are kept.
         let host = host.to_owned();
@@ -48,13 +52,20 @@ impl FrontResolver for SystemResolver {
         // Bound the lookup: a hung resolver shouldn't stall the scan. Dropping the
         // handle on timeout detaches the blocking thread (it can't be aborted), so
         // it finishes harmlessly in the background.
-        match tokio::time::timeout(RESOLVE_TIMEOUT, handle).await {
-            Ok(joined) => joined.map_err(io::Error::other)?,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "system resolver timed out",
-            )),
-        }
+        let mut addrs = match tokio::time::timeout(RESOLVE_TIMEOUT, handle).await {
+            Ok(joined) => joined.map_err(io::Error::other)??,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "system resolver timed out",
+                ))
+            }
+        };
+        // Normalize (sort + dedup) like FlintDnsResolver, so duplicate/unordered
+        // records don't cause redundant scan/dial attempts.
+        addrs.sort_unstable();
+        addrs.dedup();
+        Ok(addrs)
     }
 }
 

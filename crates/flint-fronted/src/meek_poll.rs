@@ -867,6 +867,59 @@ mod tests {
         assert_eq!(&out, b"via glue");
     }
 
+    /// In-process HTTP/1.1 keep-alive meek echo server: read each POST's
+    /// Content-Length body and echo it back with a Content-Length response. meek
+    /// polls are sequential, so a single-threaded loop suffices.
+    async fn run_h1_echo_server(io: DuplexStream) {
+        use tokio::io::AsyncBufReadExt;
+        let mut stream = tokio::io::BufReader::new(io);
+        loop {
+            let mut line = String::new();
+            if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break; // client closed
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut h = String::new();
+                if stream.read_line(&mut h).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let t = h.trim_end();
+                if t.is_empty() {
+                    break;
+                }
+                if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if stream.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                break;
+            }
+            if !body.is_empty() && stream.write_all(&body).await.is_err() {
+                break;
+            }
+            let _ = stream.flush().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn h1_echo_roundtrip() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        tokio::spawn(run_h1_echo_server(server_io));
+        let mut c = cfg();
+        c.http_version = MeekHttpVersion::H1;
+        let mut conn = MeekPollConn::connect(client_io, c).expect("connect");
+        conn.write_all(b"hello h1 meek").await.expect("write");
+        let mut out = [0u8; 13];
+        conn.read_exact(&mut out).await.expect("read");
+        assert_eq!(&out, b"hello h1 meek");
+    }
+
     #[tokio::test]
     async fn echo_roundtrip_small() {
         let (client_io, server_io) = duplex(64 * 1024);
