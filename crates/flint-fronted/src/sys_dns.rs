@@ -64,7 +64,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_an_ip_literal_without_network() {
-        let ips = SystemResolver::new().resolve("1.2.3.4").await.unwrap();
+        let resolver = SystemResolver::new();
+        let ips = resolver.resolve("1.2.3.4").await.unwrap();
         assert_eq!(ips, vec![IpAddr::from([1, 2, 3, 4])]);
     }
 }

@@ -144,12 +144,13 @@ impl MeekPollConn {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let cfg = cfg.normalized();
-        // The h1 backend writes the request line + headers by hand, so a CR/LF (or
-        // other control char) in the host/path could split the request or inject
-        // headers. Reject up front (h2 also rejects these in header values).
-        if has_control_char(&cfg.inner_host) || has_control_char(&cfg.path) {
+        // The h1 backend writes the request line + headers by hand, so any
+        // CR/LF/control, space, or non-ASCII byte in the host/path could split the
+        // request, inject headers, or break request-target/Host tokenization.
+        // Reject up front (h2 also rejects these in header values).
+        if has_invalid_host_char(&cfg.inner_host) || has_invalid_host_char(&cfg.path) {
             return Err(io::Error::other(
-                "meek: inner_host/path contains control characters",
+                "meek: inner_host/path contains invalid characters",
             ));
         }
         let session_id = random_session_id(cfg.session_id_len)?;
@@ -479,8 +480,11 @@ mod h1_backend {
                 }
                 let mut chunk = vec![0u8; size];
                 self.stream.read_exact(&mut chunk).await?;
-                let mut crlf = [0u8; 2]; // consume the chunk's trailing CRLF
+                let mut crlf = [0u8; 2]; // consume + validate the chunk's trailing CRLF
                 self.stream.read_exact(&mut crlf).await?;
+                if &crlf != b"\r\n" {
+                    return Err(io::Error::other("meek: malformed chunk terminator"));
+                }
                 // Stop *appending* past the cap, but keep draining the framing to
                 // the terminating 0-size chunk so the keep-alive connection stays
                 // aligned for the next response.
@@ -682,8 +686,10 @@ pub fn open_meek_poll_auto(
 
 /// True if `s` contains an ASCII control char (incl. CR/LF) — these can split a
 /// hand-built HTTP/1.1 request or inject headers, so the meek host/path reject them.
-fn has_control_char(s: &str) -> bool {
-    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+fn has_invalid_host_char(s: &str) -> bool {
+    // Anything outside printable non-space ASCII (control incl. CR/LF, SPACE/DEL,
+    // and non-ASCII) would break the hand-built h1 request line / Host header.
+    s.bytes().any(|b| b <= 0x20 || b >= 0x7f)
 }
 
 fn random_session_id(len: usize) -> io::Result<String> {

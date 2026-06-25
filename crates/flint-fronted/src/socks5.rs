@@ -91,6 +91,13 @@ where
             head[1]
         )));
     }
+    // RSV must be 0x00; a non-zero byte signals desync/corruption.
+    if head[2] != 0x00 {
+        return Err(io::Error::other(format!(
+            "socks5: non-zero RSV 0x{:02x} in connect reply",
+            head[2]
+        )));
+    }
     let addr_len = match head[3] {
         0x01 => 4,
         0x04 => 16,
