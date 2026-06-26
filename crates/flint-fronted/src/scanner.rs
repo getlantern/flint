@@ -37,6 +37,13 @@ pub const DEFAULT_AKAMAI_EDGE_HOSTS: &[&str] = &[
     "ds-aksb.akamaized.net",
 ];
 
+/// Cert identity an Aliyun CDN edge presents on an SNI-less (empty-SNI) handshake:
+/// the shared Alibaba CDN cert (CN `*.alicdn.com`, also covering `*.alikunlun.com`).
+/// Aliyun fronting uses empty SNI, so the edge serves THIS cert — not one for the
+/// inner `aliyun_host` — hence the verify identity must match it, not the host.
+/// Aliyun manages + auto-renews this cert, so it's a stable, publicly-trusted anchor.
+pub const DEFAULT_ALIYUN_VERIFY_HOSTNAME: &str = "img.alicdn.com";
+
 /// A scan candidate: one edge IP plus how to front through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -107,8 +114,9 @@ pub struct ScanTargets {
     /// Sample this many Alibaba Cloud (Aliyun) CDN IPs from the embedded prefix
     /// list (0 = skip). Only used when `aliyun_host` is set.
     pub aliyun_samples: usize,
-    /// Cert hostname Aliyun candidates verify against; see
-    /// [`Self::cloudfront_verify_hostname`]. `None` falls back to `aliyun_host`.
+    /// Cert hostname Aliyun candidates verify against. `None` falls back to
+    /// [`DEFAULT_ALIYUN_VERIFY_HOSTNAME`] (the shared Alibaba CDN cert the edge
+    /// serves on empty SNI) — NOT `aliyun_host`, which that cert doesn't cover.
     pub aliyun_verify_hostname: Option<String>,
     /// Aliyun edge hostnames to also resolve via the system resolver (in addition
     /// to prefix sampling; empty = none).
@@ -213,8 +221,10 @@ pub fn cloudfront_candidates(targets: &ScanTargets, seed: u64) -> Vec<Candidate>
 
 /// Sample Alibaba Cloud (Aliyun) CDN edge IPs from the embedded prefix list,
 /// plus resolve any configured Aliyun edge hostnames via the system resolver.
-/// Routes to `aliyun_host`; returns nothing when it is unset. Empty SNI; verify
-/// hostname is `aliyun_verify_hostname` if set, else `aliyun_host`.
+/// Routes to `aliyun_host` (the inner Host); returns nothing when it is unset.
+/// Empty SNI ⇒ the edge presents the shared Alibaba CDN cert, so verify against
+/// `aliyun_verify_hostname` if set, else [`DEFAULT_ALIYUN_VERIFY_HOSTNAME`] — NOT
+/// `aliyun_host`, which the empty-SNI cert does not cover.
 pub async fn aliyun_candidates<R: FrontResolver>(
     resolver: &R,
     targets: &ScanTargets,
@@ -223,7 +233,10 @@ pub async fn aliyun_candidates<R: FrontResolver>(
     let Some(host) = targets.aliyun_host.as_deref() else {
         return Vec::new();
     };
-    let verify = targets.aliyun_verify_hostname.as_deref().unwrap_or(host);
+    let verify = targets
+        .aliyun_verify_hostname
+        .as_deref()
+        .unwrap_or(DEFAULT_ALIYUN_VERIFY_HOSTNAME);
     let mut out = sample_prefix_candidates(
         "aliyun",
         aliyun_prefixes(),
@@ -657,6 +670,12 @@ mod tests {
                 other => panic!("unexpected provider {other}"),
             };
             assert_eq!(c.fronted_host, want, "{} host", c.provider);
+        }
+        // Aliyun fronts with empty SNI, so its candidates verify against the shared
+        // Alibaba CDN cert (NOT the inner host, which that cert doesn't cover).
+        for c in cands.iter().filter(|c| c.provider == "aliyun") {
+            assert_eq!(c.verify_hostname, DEFAULT_ALIYUN_VERIFY_HOSTNAME);
+            assert!(c.sni.is_empty(), "aliyun fronts with empty SNI");
         }
     }
 
