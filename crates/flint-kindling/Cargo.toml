@@ -7,11 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Pull flint-fronted's boring Chrome dial path so FrontedBootstrap can actually
+# dial edges (without it, dial_fronts_alpn returns Unsupported at runtime).
+boring = ["flint-fronted/boring"]
+
 [dependencies]
 flint-fronted = { path = "../flint-fronted" }
 flint-transport = { path = "../flint-transport" }
+# OnceCell memoizes the front scan; the orchestration is otherwise std-sync.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 flate2 = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "sync", "time"] }
