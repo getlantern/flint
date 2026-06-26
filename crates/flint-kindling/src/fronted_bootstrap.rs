@@ -228,7 +228,11 @@ mod tests {
 
     #[tokio::test]
     async fn scans_all_three_providers() {
-        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver());
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver()).with_targets(
+            ScanTargets::for_host("meek.test")
+                .with_cloudfront_host("meek.cf.test")
+                .with_aliyun_host("meek.aliyun.test"),
+        );
         let fronts = b.candidate_fronts().await;
         let providers: BTreeSet<&str> = fronts.iter().map(|f| f.front.provider.as_str()).collect();
         assert!(providers.contains("akamai"), "missing akamai");
@@ -238,7 +242,11 @@ mod tests {
 
     #[tokio::test]
     async fn caches_winning_front_and_skips_scan_next_time() {
-        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver());
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver()).with_targets(
+            ScanTargets::for_host("meek.test")
+                .with_cloudfront_host("meek.cf.test")
+                .with_aliyun_host("meek.aliyun.test"),
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let dialer = recording_dialer(calls.clone(), false);
 
@@ -253,7 +261,11 @@ mod tests {
 
     #[tokio::test]
     async fn evicts_bad_cached_front_then_falls_back_to_scan() {
-        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver());
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver()).with_targets(
+            ScanTargets::for_host("meek.test")
+                .with_cloudfront_host("meek.cf.test")
+                .with_aliyun_host("meek.aliyun.test"),
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let dialer = recording_dialer(calls.clone(), true);
 

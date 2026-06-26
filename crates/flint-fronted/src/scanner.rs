@@ -70,13 +70,17 @@ impl Candidate {
     }
 }
 
-/// What to scan for. Defaults cover Akamai (primary) + CloudFront; Aliyun and
-/// extra Akamai edge hosts are configurable. Seeds are data-driven so Google/Azure
+/// What to scan for. Each CDN routes to its own inner host (the meek endpoint
+/// behind that CDN): the inner `Host` is CDN-specific, so an Akamai host won't
+/// route through a CloudFront distribution. Akamai is primary; CloudFront and
+/// Aliyun candidates are generated only once their inner host is set — no host
+/// means no deployment there yet, so those candidates are skipped rather than
+/// scanned with a host that can't route. Seeds are data-driven so Google/Azure
 /// can be added without code changes.
 #[derive(Debug, Clone)]
 pub struct ScanTargets {
-    /// Inner host the fronts must route to (e.g. the meek endpoint).
-    pub fronted_host: String,
+    /// Inner `Host` Akamai candidates route to (the primary meek endpoint).
+    pub akamai_host: String,
     /// Akamai edge hostnames to resolve via the system resolver.
     pub akamai_edge_hosts: Vec<String>,
     /// Cert hostname for Akamai candidates (empty SNI ⇒ verify against this).
@@ -84,19 +88,27 @@ pub struct ScanTargets {
     /// Decoy SNIs to also try per Akamai IP (in addition to empty SNI). Empty =
     /// only the no-SNI variant.
     pub akamai_decoy_snis: Vec<String>,
+    /// Inner `Host` CloudFront candidates route to. `None` ⇒ no CloudFront meek
+    /// deployment yet, so CloudFront candidates are skipped entirely (the Akamai
+    /// host would not route through a CloudFront distribution).
+    pub cloudfront_host: Option<String>,
     /// Sample this many CloudFront IPs from the embedded prefix list (0 = skip).
+    /// Only used when `cloudfront_host` is set.
     pub cloudfront_samples: usize,
     /// Cert hostname CloudFront candidates verify against (empty SNI ⇒ the edge
     /// presents its default cert, NOT one for the inner host). `None` falls back to
-    /// `fronted_host`, which only verifies if the meek endpoint's CloudFront
-    /// distribution serves a cert valid for it — set this to the edge cert identity
-    /// (e.g. a `*.cloudfront.net` name) for a real CloudFront deployment.
+    /// `cloudfront_host`, which only verifies if that distribution serves a cert
+    /// valid for it — set this to the edge cert identity (e.g. a `*.cloudfront.net`
+    /// name) for a real CloudFront deployment.
     pub cloudfront_verify_hostname: Option<String>,
+    /// Inner `Host` Aliyun candidates route to. `None` ⇒ skipped (see
+    /// `cloudfront_host`).
+    pub aliyun_host: Option<String>,
     /// Sample this many Alibaba Cloud (Aliyun) CDN IPs from the embedded prefix
-    /// list (0 = skip).
+    /// list (0 = skip). Only used when `aliyun_host` is set.
     pub aliyun_samples: usize,
     /// Cert hostname Aliyun candidates verify against; see
-    /// [`Self::cloudfront_verify_hostname`]. `None` falls back to `fronted_host`.
+    /// [`Self::cloudfront_verify_hostname`]. `None` falls back to `aliyun_host`.
     pub aliyun_verify_hostname: Option<String>,
     /// Aliyun edge hostnames to also resolve via the system resolver (in addition
     /// to prefix sampling; empty = none).
@@ -105,24 +117,40 @@ pub struct ScanTargets {
 }
 
 impl ScanTargets {
-    /// Targets for fronting to `fronted_host`, Akamai-primary with the canonical
-    /// edge hosts and a modest CloudFront sample.
-    pub fn for_host(fronted_host: impl Into<String>) -> Self {
+    /// Targets for fronting to `akamai_host` through Akamai (primary), with the
+    /// canonical edge hosts. CloudFront/Aliyun stay off until their inner host is
+    /// set via [`Self::with_cloudfront_host`] / [`Self::with_aliyun_host`].
+    pub fn for_host(akamai_host: impl Into<String>) -> Self {
         Self {
-            fronted_host: fronted_host.into(),
+            akamai_host: akamai_host.into(),
             akamai_edge_hosts: DEFAULT_AKAMAI_EDGE_HOSTS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
             akamai_verify_hostname: "a248.e.akamai.net".into(),
             akamai_decoy_snis: Vec::new(),
+            cloudfront_host: None,
             cloudfront_samples: 16,
             cloudfront_verify_hostname: None,
+            aliyun_host: None,
             aliyun_samples: 16,
             aliyun_verify_hostname: None,
             aliyun_edge_hosts: Vec::new(),
             port: 443,
         }
+    }
+
+    /// Enable CloudFront candidates routing to `host` (the meek endpoint behind
+    /// the CloudFront distribution).
+    pub fn with_cloudfront_host(mut self, host: impl Into<String>) -> Self {
+        self.cloudfront_host = Some(host.into());
+        self
+    }
+
+    /// Enable Aliyun candidates routing to `host`.
+    pub fn with_aliyun_host(mut self, host: impl Into<String>) -> Self {
+        self.aliyun_host = Some(host.into());
+        self
     }
 }
 
@@ -152,7 +180,7 @@ pub async fn akamai_candidates<R: FrontResolver>(
                 addr,
                 sni,
                 verify_hostname: targets.akamai_verify_hostname.clone(),
-                fronted_host: targets.fronted_host.clone(),
+                fronted_host: targets.akamai_host.clone(),
             });
         }
     }
@@ -160,47 +188,54 @@ pub async fn akamai_candidates<R: FrontResolver>(
 }
 
 /// Sample CloudFront edge IPs from the embedded prefix list and build empty-SNI
-/// candidates. With empty SNI the edge presents its own default cert, so the
-/// verify hostname is `cloudfront_verify_hostname` if set, else `fronted_host`
-/// (see that field's docs — `fronted_host` only verifies for a CloudFront meek
-/// deployment whose cert covers it).
+/// candidates routing to `cloudfront_host`. Returns nothing when no CloudFront
+/// host is set (no meek deployment there). With empty SNI the edge presents its
+/// own default cert, so the verify hostname is `cloudfront_verify_hostname` if
+/// set, else `cloudfront_host` (which only verifies if that distribution's cert
+/// covers it).
 pub fn cloudfront_candidates(targets: &ScanTargets, seed: u64) -> Vec<Candidate> {
+    let Some(host) = targets.cloudfront_host.as_deref() else {
+        return Vec::new();
+    };
     sample_prefix_candidates(
         "cloudfront",
         cloudfront_prefixes(),
         targets,
         targets.cloudfront_samples,
+        host,
         targets
             .cloudfront_verify_hostname
             .as_deref()
-            .unwrap_or(&targets.fronted_host),
+            .unwrap_or(host),
         seed,
     )
 }
 
 /// Sample Alibaba Cloud (Aliyun) CDN edge IPs from the embedded prefix list,
 /// plus resolve any configured Aliyun edge hostnames via the system resolver.
-/// Empty SNI; verify hostname is `aliyun_verify_hostname` if set, else `fronted_host`.
+/// Routes to `aliyun_host`; returns nothing when it is unset. Empty SNI; verify
+/// hostname is `aliyun_verify_hostname` if set, else `aliyun_host`.
 pub async fn aliyun_candidates<R: FrontResolver>(
     resolver: &R,
     targets: &ScanTargets,
     seed: u64,
 ) -> Vec<Candidate> {
-    let verify = targets
-        .aliyun_verify_hostname
-        .as_deref()
-        .unwrap_or(&targets.fronted_host);
+    let Some(host) = targets.aliyun_host.as_deref() else {
+        return Vec::new();
+    };
+    let verify = targets.aliyun_verify_hostname.as_deref().unwrap_or(host);
     let mut out = sample_prefix_candidates(
         "aliyun",
         aliyun_prefixes(),
         targets,
         targets.aliyun_samples,
+        host,
         verify,
         seed,
     );
     let mut ips: BTreeSet<IpAddr> = BTreeSet::new();
-    for host in &targets.aliyun_edge_hosts {
-        if let Ok(resolved) = resolver.resolve(host).await {
+    for edge_host in &targets.aliyun_edge_hosts {
+        if let Ok(resolved) = resolver.resolve(edge_host).await {
             ips.extend(resolved);
         }
     }
@@ -210,7 +245,7 @@ pub async fn aliyun_candidates<R: FrontResolver>(
             addr: SocketAddr::new(ip, targets.port),
             sni: String::new(),
             verify_hostname: verify.to_string(),
-            fronted_host: targets.fronted_host.clone(),
+            fronted_host: host.to_string(),
         });
     }
     out
@@ -224,6 +259,7 @@ fn sample_prefix_candidates(
     prefixes: &[Prefix],
     targets: &ScanTargets,
     samples: usize,
+    fronted_host: &str,
     verify_hostname: &str,
     seed: u64,
 ) -> Vec<Candidate> {
@@ -269,7 +305,7 @@ fn sample_prefix_candidates(
             addr: SocketAddr::new(IpAddr::V4(ip), targets.port),
             sni: String::new(),
             verify_hostname: verify_hostname.to_string(),
-            fronted_host: targets.fronted_host.clone(),
+            fronted_host: fronted_host.to_string(),
         });
     }
     out
@@ -526,11 +562,16 @@ mod tests {
 
     #[test]
     fn cloudfront_sampling_is_deterministic_and_in_range() {
-        let targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
+        let targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org")
+            .with_cloudfront_host("meek.cloudfront.example");
         let a = cloudfront_candidates(&targets, 42);
         let b = cloudfront_candidates(&targets, 42);
         assert_eq!(a, b, "same seed must reproduce the same sample");
         assert_eq!(a.len(), targets.cloudfront_samples);
+        // Candidates route to the CloudFront host, not the Akamai one.
+        assert!(a
+            .iter()
+            .all(|c| c.fronted_host == "meek.cloudfront.example"));
         // Every sampled IP must fall inside an embedded prefix.
         for c in &a {
             let ip = match c.addr.ip() {
@@ -553,10 +594,24 @@ mod tests {
     fn aliyun_sampling_is_deterministic_and_in_range() {
         let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
         targets.aliyun_samples = 12;
-        let a =
-            sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, "verify.test", 99);
-        let b =
-            sample_prefix_candidates("aliyun", aliyun_prefixes(), &targets, 12, "verify.test", 99);
+        let a = sample_prefix_candidates(
+            "aliyun",
+            aliyun_prefixes(),
+            &targets,
+            12,
+            "meek.aliyun.example",
+            "verify.test",
+            99,
+        );
+        let b = sample_prefix_candidates(
+            "aliyun",
+            aliyun_prefixes(),
+            &targets,
+            12,
+            "meek.aliyun.example",
+            "verify.test",
+            99,
+        );
         assert_eq!(a, b);
         assert_eq!(a.len(), 12);
         for c in &a {
@@ -584,18 +639,49 @@ mod tests {
             vec![IpAddr::from([23, 9, 9, 9])],
         );
         let resolver = MockResolver(map);
-        let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
+        let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org")
+            .with_cloudfront_host("meek.cloudfront.example")
+            .with_aliyun_host("meek.aliyun.example");
         targets.akamai_edge_hosts = vec!["a248.e.akamai.net".into()];
         let cands = all_candidates(&resolver, &targets, 1234).await;
         let providers: BTreeSet<&str> = cands.iter().map(|c| c.provider.as_str()).collect();
         assert!(providers.contains("akamai"), "missing akamai");
         assert!(providers.contains("cloudfront"), "missing cloudfront");
         assert!(providers.contains("aliyun"), "missing aliyun");
+        // Each provider's candidates carry that provider's inner host.
+        for c in &cands {
+            let want = match c.provider.as_str() {
+                "akamai" => "meek.dsa.akamai.getiantem.org",
+                "cloudfront" => "meek.cloudfront.example",
+                "aliyun" => "meek.aliyun.example",
+                other => panic!("unexpected provider {other}"),
+            };
+            assert_eq!(c.fronted_host, want, "{} host", c.provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudfront_and_aliyun_skipped_without_a_host() {
+        // Default for_host enables only Akamai: CloudFront/Aliyun have no inner
+        // host, so they're skipped rather than scanned with the Akamai host.
+        let mut map = HashMap::new();
+        map.insert(
+            "a248.e.akamai.net".to_string(),
+            vec![IpAddr::from([23, 9, 9, 9])],
+        );
+        let resolver = MockResolver(map);
+        let mut targets = ScanTargets::for_host("meek.dsa.akamai.getiantem.org");
+        targets.akamai_edge_hosts = vec!["a248.e.akamai.net".into()];
+        assert!(cloudfront_candidates(&targets, 1).is_empty());
+        assert!(aliyun_candidates(&resolver, &targets, 1).await.is_empty());
+        let all = all_candidates(&resolver, &targets, 1).await;
+        let providers: BTreeSet<&str> = all.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(providers, BTreeSet::from(["akamai"]));
     }
 
     #[tokio::test]
     async fn scan_keeps_successes_ranked_by_latency() {
-        let targets = ScanTargets::for_host("meek.test");
+        let targets = ScanTargets::for_host("meek.test").with_cloudfront_host("meek.cf.test");
         let cands = cloudfront_candidates(&targets, 7);
         assert!(cands.len() >= 4);
         // Mock probe: fail one provider-less subset, vary latency by last octet.
