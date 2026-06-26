@@ -134,9 +134,17 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
         // 1. Reuse the front that worked last time, if any.
         let cached = self.locked_cache().clone();
         if let Some(front) = cached {
-            match dial(vec![front]).await {
+            match dial(vec![front.clone()]).await {
                 Ok((_, resp)) => return Ok(resp),
-                Err(_) => *self.locked_cache() = None, // stale edge — drop it and rescan
+                Err(_) => {
+                    // Stale edge — drop it and rescan, but only if the cache still points at the
+                    // entry we just retried: a concurrent request may have cached a newer winner
+                    // while this dial was in flight, and clobbering it would force a needless race.
+                    let mut guard = self.locked_cache();
+                    if guard.as_ref() == Some(&front) {
+                        *guard = None;
+                    }
+                }
             }
         }
         // 2. Scan once, race the full candidate set, cache the winner.
@@ -255,7 +263,11 @@ mod tests {
         assert_eq!(b.request_with(&dialer).await.unwrap().status, 200);
 
         let lens = calls.lock().unwrap().clone();
-        assert_eq!(lens, vec![lens[0], 1, lens[2]]);
+        assert_eq!(
+            lens.len(),
+            3,
+            "expected full-race, cached retry, then fallback race"
+        );
         assert!(lens[0] > 1);
         assert_eq!(lens[1], 1);
         assert!(lens[2] > 1);
