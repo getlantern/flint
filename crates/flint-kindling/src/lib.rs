@@ -10,9 +10,13 @@ pub use flint_transport::{
 };
 
 pub use flint_fronted::{
-    h2_oneshot, DirectH2Dialer, FlintDnsResolver, FrontResolver, FrontedMeekDialer,
-    FrontedTlsDialer, HttpResponse, OneshotRequest,
+    dial_fronts, dial_fronts_alpn, h2_oneshot, DialOptions, DirectH2Dialer, FlintDnsResolver,
+    FrontResolver, FrontedMeekDialer, FrontedTlsDialer, HttpResponse, MaterializedFront,
+    OneshotRequest, ScanTargets, SystemResolver,
 };
+
+pub mod fronted_bootstrap;
+pub use fronted_bootstrap::FrontedBootstrap;
 
 pub struct Kindling {
     transports: Vec<Box<dyn BoxedConnectionTransport>>,
