@@ -119,11 +119,10 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
                 let idx = conn.candidate_index;
                 // Address the request to the winning front's inner host, not the
                 // bootstrap's default — else a CloudFront/Aliyun front (whose inner
-                // host differs from Akamai) dials fine but fails to route.
-                let inner = fronts
-                    .get(idx)
-                    .map(|f| f.front.fronted_host.clone())
-                    .unwrap_or_else(|| host.clone());
+                // host differs from Akamai) dials fine but fails to route. Take it
+                // from the connection (candidate_index indexes the flattened
+                // front×addr dial list, not the `fronts` slice).
+                let inner = conn.fronted_host().to_owned();
                 let resp = h2_oneshot(conn.stream, &inner, &req).await?;
                 Ok((idx, resp))
             }
