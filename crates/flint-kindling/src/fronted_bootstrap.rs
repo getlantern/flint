@@ -116,28 +116,34 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
                 let conn = dial_fronts_alpn(&host, &fronts, options)
                     .await
                     .map_err(io::Error::other)?;
-                let idx = conn.candidate_index;
-                // Address the request to the winning front's inner host, not the
-                // bootstrap's default — else a CloudFront/Aliyun front (whose inner
-                // host differs from Akamai) dials fine but fails to route. Take it
-                // from the connection (candidate_index indexes the flattened
-                // front×addr dial list, not the `fronts` slice).
+                // Address the request to — and cache — the *winning* front taken
+                // straight from the connection: its own inner host (a CloudFront/
+                // Aliyun front routes by a different host than Akamai) and the exact
+                // addr that won. Don't index back into `fronts` by candidate_index:
+                // that indexes the flattened front×addr dial list, not the `fronts`
+                // slice, so it can pick the wrong front if a front carries >1 addr.
+                let win = MaterializedFront {
+                    front: conn.front.clone(),
+                    addrs: vec![conn.addr],
+                };
                 let inner = conn.fronted_host().to_owned();
                 let resp = h2_oneshot(conn.stream, &inner, &req).await?;
-                Ok((idx, resp))
+                Ok((win, resp))
             }
         })
         .await
     }
 
     /// Orchestration shared by production and tests. `dial` performs the actual
-    /// fronted dial + request over a slice of fronts, returning the winning index
-    /// (into that slice) and the response — injectable so the cache/evict logic is
-    /// testable without boring/network.
+    /// fronted dial + request over a slice of fronts, returning the **winning
+    /// front** (to cache) and the response — injectable so the cache/evict logic is
+    /// testable without boring/network. The winner is carried out of the dial
+    /// rather than indexed back into the slice, so caching can't alias the wrong
+    /// front (see `request`).
     async fn request_with<F, Fut>(&self, dial: F) -> io::Result<HttpResponse>
     where
         F: Fn(Vec<MaterializedFront>) -> Fut,
-        Fut: std::future::Future<Output = io::Result<(usize, HttpResponse)>>,
+        Fut: std::future::Future<Output = io::Result<(MaterializedFront, HttpResponse)>>,
     {
         // 1. Reuse the front that worked last time, if any.
         let cached = self.locked_cache().clone();
@@ -162,10 +168,8 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
                 "fronted bootstrap: scan produced no candidate fronts",
             ));
         }
-        let (idx, resp) = dial(fronts.clone()).await?;
-        if let Some(win) = fronts.get(idx) {
-            *self.locked_cache() = Some(win.clone());
-        }
+        let (win, resp) = dial(fronts).await?;
+        *self.locked_cache() = Some(win);
         Ok(resp)
     }
 
@@ -194,8 +198,9 @@ mod tests {
         }
     }
 
-    type BoxedDialFut =
-        std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<(usize, HttpResponse)>>>>;
+    type BoxedDialFut = std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<(MaterializedFront, HttpResponse)>>>,
+    >;
 
     fn akamai_resolver() -> MockResolver {
         let mut m = HashMap::new();
@@ -228,7 +233,9 @@ mod tests {
                 if fail_single && n == 1 {
                     Err(io::Error::other("cached front dead"))
                 } else {
-                    Ok((0usize, resp(200)))
+                    // Return the winning front itself (the first raced) — the
+                    // production path likewise carries the winner out of the dial.
+                    Ok((fronts[0].clone(), resp(200)))
                 }
             })
         }
