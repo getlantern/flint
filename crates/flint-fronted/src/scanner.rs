@@ -37,8 +37,9 @@ pub const DEFAULT_AKAMAI_EDGE_HOSTS: &[&str] = &[
     "ds-aksb.akamaized.net",
 ];
 
-/// Cert identity an Aliyun CDN edge presents on an SNI-less (empty-SNI) handshake:
-/// the shared Alibaba CDN cert (CN `*.alicdn.com`, also covering `*.alikunlun.com`).
+/// The cert identity an Aliyun CDN edge presents on an SNI-less (empty-SNI)
+/// handshake — the shared Alibaba CDN cert (CN `*.alicdn.com`, which also covers
+/// `*.alikunlun.com`).
 /// Aliyun fronting uses empty SNI, so the edge serves THIS cert — not one for the
 /// inner `aliyun_host` — hence the verify identity must match it, not the host.
 /// Aliyun manages + auto-renews this cert, so it's a stable, publicly-trusted anchor.

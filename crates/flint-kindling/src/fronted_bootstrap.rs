@@ -101,7 +101,9 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
 
     /// Front `req` through a scanned edge and return the response. Tries the cached
     /// winning front first; on failure (or none) scans + races all candidates and
-    /// caches the winner. `req`'s `Host`/`:authority` is taken from `fronted_host`.
+    /// caches the winner. `req`'s `Host`/`:authority` is the **winning front's**
+    /// `fronted_host` — CDN-specific, since CloudFront/Aliyun route by a different
+    /// inner host than Akamai.
     pub async fn request(&self, req: &OneshotRequest) -> io::Result<HttpResponse> {
         let host = self.fronted_host.clone();
         let options = self.options.clone();
@@ -115,7 +117,14 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
                     .await
                     .map_err(io::Error::other)?;
                 let idx = conn.candidate_index;
-                let resp = h2_oneshot(conn.stream, &host, &req).await?;
+                // Address the request to the winning front's inner host, not the
+                // bootstrap's default — else a CloudFront/Aliyun front (whose inner
+                // host differs from Akamai) dials fine but fails to route.
+                let inner = fronts
+                    .get(idx)
+                    .map(|f| f.front.fronted_host.clone())
+                    .unwrap_or_else(|| host.clone());
+                let resp = h2_oneshot(conn.stream, &inner, &req).await?;
                 Ok((idx, resp))
             }
         })
