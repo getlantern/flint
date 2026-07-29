@@ -328,10 +328,20 @@ with the certificate check unchanged. (`find`'s multi-domain form still exists f
 One interaction needs care: the first connection on a new network is a **search**, not a dial, and can
 outlast `RaceOptions::attempt_timeout` (default 15s). Being killed mid-search is worse than slow, because
 no winner is recorded — so the cache never populates and *every* later attempt fails identically, making
-a slow cold start look like a permanently broken transport. Hence two knobs: `with_max_candidates` bounds
-the cold search (trimming resolvers, never wire plans, so no shaping strategy is silently dropped), and
-`warm` runs the search outside any race so the first in-race connect is a single cached dial. Prefer
-warming over raising the timeout for every transport.
+a slow cold start look like a permanently broken transport. Hence two knobs. `with_max_candidates` is a
+**strict** upper bound on candidates tried: resolvers are trimmed first, keeping every wire plan available
+while the budget allows — resolver diversity is the cheaper thing to lose, since the pool is deliberately
+redundant while each shaping plan is a distinct evasion strategy — and only a cap below the plan count
+sacrifices plans, keeping the first (cheapest) ones because enumeration is wire-major. `warm` runs the
+search outside any race so the first in-race connect is a single cached dial; prefer it over raising the
+timeout for every transport.
+
+Each attempt is separately bounded (5s), which matters more than it looks: a censor's usual move is to
+**blackhole** rather than refuse, and `flint_dial::dial` does not bound its TCP connect, so an unbounded
+candidate would hold its window slot indefinitely and stop the race refilling — the search would then wait
+on its least responsive candidate. With a window of 4, N candidates therefore finish within
+`ceil(N / 4) × 5s`, so a cap of 8 lands inside the 15s `RaceOptions` default. That arithmetic is the whole
+reason the cap has to be strict.
 
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 

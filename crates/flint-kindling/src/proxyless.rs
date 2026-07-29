@@ -36,8 +36,10 @@ const DEFAULT_PORT: u16 = 443;
 ///
 /// Two mitigations, and it is worth using both:
 ///
-/// - [`with_max_candidates`](Self::with_max_candidates) bounds how much of the space a single cold search
-///   will try, so its worst case is predictable rather than proportional to the pool.
+/// - [`with_max_candidates`](Self::with_max_candidates) is a strict upper bound on how many candidates a
+///   single cold search will try, so its worst case is predictable rather than proportional to the pool.
+///   It trims resolvers first and only sacrifices wire plans when the cap is smaller than the number of
+///   plans — see that method for the trade-off it makes.
 /// - [`warm`](Self::warm) runs the search **outside** any race, so the first in-race connect is a single
 ///   dial against an already-cached winner. Callers that can afford a one-off startup cost should prefer
 ///   this over raising the race's timeout for every transport.
@@ -71,32 +73,47 @@ impl ProxylessTransport {
         self
     }
 
-    /// Cap how many candidates a cold search will try, bounding its worst-case duration so it fits
-    /// inside the race's per-attempt timeout. See the type docs.
+    /// Cap how many candidates a cold search will try — a **strict** upper bound, so its worst-case
+    /// duration is predictable and can be kept inside the race's per-attempt timeout.
     ///
-    /// The cap keeps the space's enumeration order, which is wire-major — so a small cap still tries
-    /// every resolver against the cheapest (no-op) plan before it starts spending on shaping.
+    /// `0` is treated as `1`: a cap that searched nothing could never find a strategy, so it would turn
+    /// the transport off rather than bound it.
+    ///
+    /// Candidates are `resolvers × wire plans`, so honouring an exact count means giving something up.
+    /// Resolvers are trimmed first, keeping every wire plan available for as long as the budget allows —
+    /// resolver diversity is the cheaper thing to lose, since the pool is deliberately redundant while
+    /// each shaping plan is a distinct evasion strategy. Only when the cap is smaller than the number of
+    /// plans must plans go too, and then the *first* ones survive: enumeration is wire-major with the
+    /// no-op plan first, so an aggressive cap keeps the cheapest strategies and drops the exotic ones.
     pub fn with_max_candidates(mut self, max: usize) -> Self {
-        self.max_candidates = Some(max);
+        self.max_candidates = Some(max.max(1));
         self
     }
 
-    /// The space this transport searches, truncated to `max_candidates` when one is set.
+    /// The space this transport searches, trimmed so its candidate count never exceeds
+    /// `max_candidates`.
     fn search_space(&self) -> Space {
-        match self.max_candidates {
-            // A cap only has to bound the *candidate count*, and candidates are `resolvers × wires`
-            // enumerated wire-major. Trimming the resolver list is therefore the honest way to cap:
-            // it keeps every wire plan reachable, where trimming wires would silently drop shaping
-            // strategies the network may specifically require.
-            Some(max) if max > 0 && self.space.len() > max => {
-                let wires = self.space.wires.len().max(1);
-                let keep = (max / wires).max(1);
-                let mut trimmed = self.space.clone();
-                trimmed.resolvers.truncate(keep);
-                trimmed
-            }
-            _ => self.space.clone(),
+        let Some(max) = self.max_candidates else {
+            return self.space.clone();
+        };
+        // `with_max_candidates` already floors this at 1, but a struct field is not a proof.
+        let max = max.max(1);
+        if self.space.len() <= max {
+            return self.space.clone();
         }
+
+        let mut trimmed = self.space.clone();
+        let wires = trimmed.wires.len().max(1);
+        if max < wires {
+            // Not enough budget for even one resolver against every plan, so plans have to give. Keep
+            // the first `max` of them — wire-major order makes those the cheapest.
+            trimmed.resolvers.truncate(1);
+            trimmed.wires.truncate(max);
+        } else {
+            // `max / wires >= 1` here, so this always leaves a usable space.
+            trimmed.resolvers.truncate(max / wires);
+        }
+        trimmed
     }
 
     /// Run the search now, outside any race, so the winner is cached before the first real connection.
@@ -180,15 +197,50 @@ mod tests {
     }
 
     #[test]
-    fn a_cap_always_leaves_at_least_one_resolver() {
-        // A cap smaller than the number of wire plans must not trim the space to nothing.
+    fn the_cap_is_a_strict_upper_bound_at_every_size() {
+        // The regression this guards: an earlier version kept one resolver but every wire plan, so a cap
+        // below the plan count produced *more* candidates than requested — silently defeating the
+        // cold-start bound the knob exists to provide.
+        let space = Space::new(resolvers(6))
+            .with_wire(Default::default())
+            .with_wire(Default::default()); // 3 plans → 18 candidates uncapped
+        assert_eq!(Space::len(&space), 18);
+
+        for max in 1..=20 {
+            let capped = ProxylessTransport::new(space.clone(), "wifi")
+                .with_max_candidates(max)
+                .search_space();
+            assert!(
+                capped.len() <= max,
+                "cap {max} produced {} candidates",
+                capped.len()
+            );
+            assert!(!capped.is_empty(), "cap {max} left nothing to search");
+        }
+    }
+
+    #[test]
+    fn a_cap_below_the_plan_count_keeps_the_cheapest_plans() {
+        // 3 plans, cap of 2: one resolver and the first two plans. Wire-major order puts the no-op plan
+        // first, so an aggressive cap keeps the cheap strategies and drops the exotic ones.
         let space = Space::new(resolvers(6))
             .with_wire(Default::default())
             .with_wire(Default::default());
-        let t = ProxylessTransport::new(space, "wifi").with_max_candidates(1);
-        let capped = t.search_space();
+        let capped = ProxylessTransport::new(space, "wifi")
+            .with_max_candidates(2)
+            .search_space();
+        assert_eq!(capped.len(), 2);
         assert_eq!(capped.resolvers.len(), 1);
-        assert!(!capped.is_empty());
+        assert_eq!(capped.wires.len(), 2);
+    }
+
+    #[test]
+    fn a_zero_cap_is_treated_as_one_rather_than_disabling_the_search() {
+        let space = Space::new(resolvers(4));
+        let capped = ProxylessTransport::new(space, "wifi")
+            .with_max_candidates(0)
+            .search_space();
+        assert_eq!(capped.len(), 1, "a cap of 0 must not search nothing");
     }
 
     #[tokio::test]

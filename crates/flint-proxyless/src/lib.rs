@@ -40,6 +40,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flint_dial::{BootstrapStrategy, CertVerification};
 use flint_dns::TYPE_A;
@@ -69,6 +70,35 @@ const PROBE_WINDOW: usize = 4;
 /// The port a probe connects to. Proxyless verification needs a host speaking TLS, and the test
 /// domains are ordinary HTTPS sites.
 const PROBE_PORT: u16 = 443;
+
+/// Per-attempt deadline on a single candidate.
+///
+/// Without this a candidate can hang until the OS gives up: [`flint_dial::dial`] does not bound its TCP
+/// connect, and a censor's usual move is to **blackhole** rather than refuse, so a filtered address
+/// stalls instead of erroring. Under windowing that is worse than slow — a stalled candidate keeps
+/// holding its slot, so [`race_windowed`](flint_dial::race_windowed) never refills and the whole search
+/// waits on the least responsive candidate. Bounding each attempt frees the slot and turns a blackhole
+/// into an ordinary losing candidate.
+///
+/// Matches `flint-dns`'s per-resolver bound, and is chosen so a capped search fits inside a caller's own
+/// timeout: at [`PROBE_WINDOW`] 4, N candidates finish within `ceil(N / 4) × 5s`, so a cap of 8 lands
+/// under the 15s default of `flint_transport::RaceOptions`.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `attempt` under [`ATTEMPT_TIMEOUT`], reporting a timeout as an ordinary failure so a stalled
+/// candidate loses its race rather than blocking it.
+async fn bounded<F, T>(attempt: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match tokio::time::timeout(ATTEMPT_TIMEOUT, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "proxyless candidate attempt timed out",
+        )),
+    }
+}
 
 /// Why a search failed.
 #[derive(Debug, thiserror::Error)]
@@ -366,11 +396,13 @@ pub async fn connect_cached(
         });
     }
 
-    // Fast path: retry whatever last worked here. A failure is not fatal — it means this network has
-    // changed, so fall through to a fresh search rather than giving up.
+    // Fast path: retry whatever last worked here, bounded so a since-blackholed winner cannot hang the
+    // caller. A failure is not fatal — it means this network has changed, so fall through to a fresh
+    // search rather than giving up. A timeout counts as a failure for exactly that reason: otherwise the
+    // bound would be defeated on the very path that runs most often.
     if let Some(entry) = cache.winner(network) {
         match entry.resolve(space) {
-            Some(strategy) => match dial(&strategy, host, port).await {
+            Some(strategy) => match bounded(dial(&strategy, host, port)).await {
                 Ok(stream) => return Ok((strategy, stream)),
                 Err(_) => cache.forget(network),
             },
@@ -384,7 +416,7 @@ pub async fn connect_cached(
         let strategy = space
             .strategy(i)
             .ok_or_else(|| io::Error::other(format!("candidate index {i} out of range")))?;
-        let stream = dial(&strategy, host, port).await?;
+        let stream = bounded(dial(&strategy, host, port)).await?;
         Ok((i, strategy, stream))
     })
     .await;
@@ -408,11 +440,17 @@ pub async fn connect_cached(
 /// being mistaken for success. The handshake is torn down immediately; only whether it completed
 /// matters.
 ///
+/// Bounded by a per-attempt deadline (5s), so a blackholed candidate loses its race instead of stalling
+/// it — a censor is more likely to blackhole than to refuse.
+///
 /// Requires the `boring` feature; without it [`flint_dial::dial`] reports the engine unsupported.
 pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
-    let addr = resolve_first(strategy, domain).await?;
-    let _stream = flint_dial::dial(&verified(addr, domain, &strategy.policy)).await?;
-    Ok(())
+    bounded(async {
+        let addr = resolve_first(strategy, domain).await?;
+        let _stream = flint_dial::dial(&verified(addr, domain, &strategy.policy)).await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Dial `host`:`port` through `strategy` — the payoff once [`find`] has chosen one.
