@@ -278,8 +278,9 @@ relies on.
 Trust anchors come from `DialPolicy::roots`: empty means the platform default store, which is
 `X509_STORE_set_default_paths()` and therefore OpenSSL's compile-time paths plus the
 `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides. Desktop platforms have a working store; **mobile does not**,
-so an embedder must point those env vars at a bundled anchor set (spark does exactly this in
-`core/src/ca_roots.rs`, for the same reason fronted TLS needed it) or pin roots explicitly. The public
+so an embedder must point those env vars at a bundled anchor set or pin roots explicitly. (The spark
+embedder — a separate repo, not this one — does exactly this in its `core/src/ca_roots.rs`, added for
+the same reason fronted TLS needed it.) The public
 `resolve`/`resolve_cached` signatures are unchanged — `*_with` variants take a policy — so existing
 consumers gain verification without a code change.
 
@@ -394,7 +395,8 @@ keeps every channel simple.
   down-ranking was needed.
 - **Trust anchors on mobile.** Empty `DialPolicy::roots` falls back to OpenSSL's default paths, which
   are empty on Android/iOS unless the embedder points `SSL_CERT_FILE`/`SSL_CERT_DIR` at a bundled set
-  (spark's `core/src/ca_roots.rs`). That coupling is implicit: flint cannot tell whether an embedder
+  (as the spark embedder does in its own repo — see §6.1). That coupling is implicit: flint cannot tell
+  whether an embedder
   has done it, and gets an indistinguishable "unable to get local issuer certificate" either way. Open:
   whether flint should expose a cheap self-check (verify one known-good anchor at startup) so a
   misconfigured embedder fails loudly at init instead of looking like a blocked network.

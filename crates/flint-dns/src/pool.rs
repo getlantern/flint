@@ -101,24 +101,29 @@ pub struct Resolver {
     pub path: String,
 }
 
-/// How a resolver dial is **shaped** and **trusted**.
+/// How a TLS dial is **shaped** and **trusted**.
 ///
 /// Bundling the two keeps the resolve signatures stable as knobs are added, and makes the trust
 /// decision something a caller states rather than something it inherits by accident — which is exactly
-/// how the dial went unauthenticated before (see [`Resolver::tls_strategy_with`]).
+/// how the resolver dial went unauthenticated before (see [`Resolver::tls_strategy_with`]).
+///
+/// Named for the resolver dial it was introduced for, but deliberately not specific to it: `flint-dns`
+/// applies it to resolver dials and `flint-proxyless` to destination dials as well, so that both legs
+/// of a proxyless connection are shaped and anchored from one value. Read every field as applying to
+/// whichever TLS peer the policy is used against.
 #[derive(Debug, Clone, Default)]
 pub struct DialPolicy {
     /// Opening-handshake shaping (the shaping axis; see [`Resolver::tls_strategy_with`]).
     pub wire: WirePlan,
-    /// PEM trust anchors used to verify the resolver's certificate.
+    /// PEM trust anchors used to verify the peer's certificate.
     ///
     /// Empty (the default) means the platform's default store — on desktop the system roots, and on
     /// mobile whatever the embedder has pointed `SSL_CERT_FILE`/`SSL_CERT_DIR` at, since Android and
     /// iOS keep their trust roots where OpenSSL's default paths cannot see them. An embedder that
     /// bundles its own anchor set can pin it here instead.
     ///
-    /// `Arc` because one root set is shared across every resolver in a pool: cloning it per dial is a
-    /// refcount bump, not a copy of the PEM data.
+    /// `Arc` because one root set is shared across many dials — every resolver in a pool, every
+    /// candidate in a search — so cloning it per dial is a refcount bump, not a copy of the PEM data.
     pub roots: Arc<[String]>,
 }
 
