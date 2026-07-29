@@ -41,8 +41,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use flint_dial::{BootstrapStrategy, BoxedTlsStream, CertVerification, WirePlan};
-use flint_dns::{DialPolicy, Resolver, TYPE_A};
+use flint_dial::{BootstrapStrategy, CertVerification};
+use flint_dns::TYPE_A;
+
+// Re-exported because they are unavoidable in this crate's own API: a caller cannot build a [`Space`]
+// without [`Resolver`] and [`WirePlan`], cannot read a [`Strategy`] without [`DialPolicy`], and cannot
+// name what [`dial`] returns without [`BoxedTlsStream`]. Requiring a direct `flint-dns`/`flint-dial`
+// dependency just to spell this crate's types would be a papercut.
+pub use flint_dial::{BoxedTlsStream, WirePlan};
+pub use flint_dns::{DialPolicy, Resolver};
 
 pub mod cache;
 
@@ -326,6 +333,71 @@ where
         cache.record(network, entry);
     }
     Ok(strategy)
+}
+
+/// Connect to `host`:`port` by searching for a strategy that reaches it, returning the winning
+/// connection **and** the strategy that produced it.
+///
+/// Unlike [`find`], nothing is probed separately: the connection the caller wanted *is* the proof, so a
+/// candidate that succeeds hands back a usable stream instead of being re-dialed afterwards. That halves
+/// the handshakes, and the oracle is exactly as strong — the certificate still has to verify against
+/// `host`.
+///
+/// The two entry points answer different questions, and both are worth having:
+///
+/// - [`find_cached`] asks *"what works on this network?"* against several test domains, so one
+///   accidentally-open path cannot vouch for the rest. Use it to characterize a network.
+/// - this asks *"just get me to this host"*, where the host is its own sufficient oracle.
+///
+/// `cache` is consulted first and the winner recorded, with the same discipline as [`find_cached`]: a
+/// cached strategy is retried, never trusted, and dropped the moment it fails, so a strategy the censor
+/// has since caught cannot pin the client to a dead path.
+pub async fn connect_cached(
+    space: &Space,
+    host: &str,
+    port: u16,
+    cache: &StrategyCache,
+    network: &str,
+) -> Result<(Strategy, BoxedTlsStream), FindError> {
+    if space.is_empty() {
+        return Err(FindError::EmptySpace {
+            resolvers: space.resolvers.len(),
+            wires: space.wires.len(),
+        });
+    }
+
+    // Fast path: retry whatever last worked here. A failure is not fatal — it means this network has
+    // changed, so fall through to a fresh search rather than giving up.
+    if let Some(entry) = cache.winner(network) {
+        match entry.resolve(space) {
+            Some(strategy) => match dial(&strategy, host, port).await {
+                Ok(stream) => return Ok((strategy, stream)),
+                Err(_) => cache.forget(network),
+            },
+            // The entry no longer names anything in this space (pool updated, shaping list changed).
+            None => cache.forget(network),
+        }
+    }
+
+    let total = space.len();
+    let winner = flint_dial::race_windowed(total, PROBE_WINDOW, |i| async move {
+        let strategy = space
+            .strategy(i)
+            .ok_or_else(|| io::Error::other(format!("candidate index {i} out of range")))?;
+        let stream = dial(&strategy, host, port).await?;
+        Ok((i, strategy, stream))
+    })
+    .await;
+
+    match winner {
+        Ok((_raced, (index, strategy, stream))) => {
+            if let Some(entry) = space.entry_for(index) {
+                cache.record(network, entry);
+            }
+            Ok((strategy, stream))
+        }
+        Err(_errors) => Err(FindError::AllFailed { tried: total }),
+    }
 }
 
 /// Verify that `strategy` reaches `domain`: resolve it through the strategy's resolver, then complete a

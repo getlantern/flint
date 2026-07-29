@@ -316,6 +316,23 @@ destination: this defeats *blocking*, not *observation*, and does nothing agains
 It is a reachability tool, not an anonymity one, and must not silently stand in for a proxy path a user
 believes is carrying their traffic.
 
+**As a Kindling race member (`ProxylessTransport`).** The bootstrap use case is a config fetch, so
+proxyless is registered alongside the fronted and direct-h2 transports and raced like any other: it
+costs no infrastructure and burns no fronting domains, so it is free to lose on an open network (where
+the direct dial wins) and earns its place where DNS is poisoned or the ClientHello is being classified.
+Here the target host is its own sufficient oracle, so `connect_cached` searches by attempting the *real*
+verified dial and returns the winning connection — one handshake per candidate instead of probe-then-dial,
+with the certificate check unchanged. (`find`'s multi-domain form still exists for the different question,
+"what works on this network".)
+
+One interaction needs care: the first connection on a new network is a **search**, not a dial, and can
+outlast `RaceOptions::attempt_timeout` (default 15s). Being killed mid-search is worse than slow, because
+no winner is recorded — so the cache never populates and *every* later attempt fails identically, making
+a slow cold start look like a permanently broken transport. Hence two knobs: `with_max_candidates` bounds
+the cold search (trimming resolvers, never wire plans, so no shaping strategy is silently dropped), and
+`warm` runs the search outside any race so the first in-race connect is a single cached dial. Prefer
+warming over raising the timeout for every transport.
+
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
 Browsers do DoH with *their own* ClientHello, so a generic (rustls) TLS stack doing DoH is **itself a
