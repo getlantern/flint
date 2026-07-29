@@ -15,9 +15,15 @@ use flint_verify::{SignedBlobVerifier, VerifyError, SIG_LEN};
 
 use crate::pool::Resolver;
 
-/// Artifact magic for a flint resolver-pool update, v1. Bump (e.g. `FRP2`) on a schema change so an
-/// old client rejects a new-format pool rather than mis-decoding it.
-pub const POOL_MAGIC: [u8; 4] = *b"FRP1";
+/// Artifact magic for a flint resolver-pool update, v2. Bump on a schema change so an old client
+/// rejects a new-format pool rather than mis-decoding it.
+///
+/// Bumped `FRP1` → `FRP2` when [`Resolver`] gained its `kind` field (the DoH/DoT/TCP/UDP/system axis).
+/// The payload is **postcard**, which is not self-describing: fields are positional with no names or
+/// defaults, so an added field shifts every byte after it. An `FRP1` client handed an `FRP2` pool would
+/// not merely miss `kind`, it would mis-parse the whole list — hence a magic bump rather than a
+/// tolerated schema drift.
+pub const POOL_MAGIC: [u8; 4] = *b"FRP2";
 
 /// Errors loading a signed pool update.
 #[derive(Debug, thiserror::Error)]
@@ -114,20 +120,20 @@ mod tests {
 
     fn sample_pool() -> Vec<Resolver> {
         vec![
-            Resolver {
-                name: "edge".into(),
-                target: "104.16.249.249:443".parse().unwrap(),
-                sni: "cloudflare-dns.com".into(),
-                host: "cloudflare-dns.com".into(),
-                path: "/dns-query".into(),
-            },
-            Resolver {
-                name: "quad9".into(),
-                target: "9.9.9.10:443".parse().unwrap(),
-                sni: "dns.quad9.net".into(),
-                host: "dns.quad9.net".into(),
-                path: "/dns-query".into(),
-            },
+            Resolver::doh(
+                "edge",
+                "104.16.249.249:443".parse().unwrap(),
+                "cloudflare-dns.com",
+                "cloudflare-dns.com",
+                "/dns-query",
+            ),
+            Resolver::doh(
+                "quad9",
+                "9.9.9.10:443".parse().unwrap(),
+                "dns.quad9.net",
+                "dns.quad9.net",
+                "/dns-query",
+            ),
         ]
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "flint-dns"
-description = "Resilient DoH resolver (race, validate, cache) + a minimal A/AAAA DNS codec."
+description = "Resilient DNS resolver (DoH/DoT/TCP/UDP/system; race, validate, cache) + a minimal A/AAAA DNS codec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,14 +22,17 @@ futures = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
 postcard = { workspace = true }
+# CSPRNG for plaintext DNS transaction IDs (the off-path-injection defense). The same `ring` the rest
+# of flint already uses, so this adds no new crypto dependency.
+ring = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "rt", "time"] }
+# `net` is required by the non-DoH transports: a UDP socket, a plain TCP connect, and the system
+# resolver's `lookup_host`.
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time"] }
 
 [dev-dependencies]
 # A local in-memory h2 server for the DoH round-trip test (no network).
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
 h2 = { workspace = true }
 http = { workspace = true }
-# Ed25519 *signing* to forge a signed pool in the signed-update tests (clients only ever verify).
-ring = { workspace = true }

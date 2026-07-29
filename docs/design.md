@@ -232,6 +232,31 @@ the next composition.
 bytes; bootstrap only needs A/AAAA of a few hostnames) to protect the binary budget, vs pulling
 `hickory-proto` (pure-Rust, handles DoH/DoT/DoQ + full wire format, but sizable). Open question §11.
 
+### 6.1 The resolver-transport axis (built) — and why it is orthogonal to shaping
+
+The "AND transports" spread above is realized by `pool::Kind`: **DoH** (RFC 8484 over h2), **DoT**
+(RFC 7858), plaintext **TCP** and **UDP** (RFC 1035), and the **system** resolver. This is the *DNS
+axis* of a proxyless strategy: where and by what protocol an answer is obtained.
+
+It is deliberately **independent of the wire-shaping axis** (§5). A resolver contributes addressing;
+a `WirePlan` contributes opening-handshake shape (record fragmentation, segment splitting,
+inter-segment jitter). `Resolver::strategy_with(wire)` / `resolve_one_shaped` compose the two, so a
+DoH lookup can itself be carried over a fragmented, jittered ClientHello — the same shaping
+vocabulary used for a destination dial, aimed at the DNS dial. Keeping them orthogonal is what makes
+the strategy space a product (`resolver × wire`) that a search can enumerate, rather than a fixed
+list of hand-written combinations. Shaping applies to the TLS-based kinds only (`Kind::is_shapeable`);
+plaintext DNS has no ClientHello and the system resolver exposes no socket.
+
+**Trust is not uniform across the axis, and the code says so.** DoH/DoT are encrypted, so a censor
+can only block them; plaintext TCP/UDP and the system resolver are *poisonable*. Answer validation
+above rejects **bogons**, but nothing here proves an answer is *correct* — a censor returning a
+plausible wrong address passes validation. So the plaintext kinds are excluded from `default_pool()`
+and are sound only inside a search that verifies the answer end-to-end by completing a TLS handshake
+with a valid certificate against the resolved address. Where they are used, the query carries a
+CSPRNG transaction ID that is checked on return, and UDP `connect`s its socket (kernel-level source
+filtering) on a random ephemeral port — the standard bar against **off-path** injection, which
+censors including the GFW perform by blasting forged answers without seeing the query.
+
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
 Browsers do DoH with *their own* ClientHello, so a generic (rustls) TLS stack doing DoH is **itself a

@@ -19,30 +19,155 @@
 
 use std::net::SocketAddr;
 
-use flint_dial::BootstrapStrategy;
+use flint_dial::{BootstrapStrategy, WirePlan};
 
-/// One DoH resolver, addressed for a fixed-IP dial. Fields are **owned** (not `&'static str`) so a
+/// Which DNS protocol a resolver speaks — the **DNS axis** of a proxyless strategy.
+///
+/// [`Doh`](Kind::Doh) and [`Dot`](Kind::Dot) are encrypted, so a censor can only *block* the
+/// connection, never poison the answer. [`Tcp`](Kind::Tcp) and [`Udp`](Kind::Udp) are **plaintext and
+/// therefore poisonable**; they earn a place in the strategy space only because some networks filter
+/// encrypted DNS while leaving plaintext queries to an unfiltered resolver alone. They are deliberately
+/// absent from [`default_pool`] — see that function for why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Kind {
+    /// DNS-over-HTTPS (RFC 8484) over HTTP/2, port 443. Uses `sni`, `host`, and `path`.
+    #[default]
+    Doh,
+    /// DNS-over-TLS (RFC 7858), port 853: length-prefixed DNS inside TLS. Uses `sni`; ignores
+    /// `host`/`path`.
+    Dot,
+    /// Plaintext DNS over TCP (RFC 1035 §4.2.2), port 53: length-prefixed. Ignores `sni`/`host`/`path`.
+    Tcp,
+    /// Plaintext DNS over UDP (RFC 1035), port 53. Ignores `sni`/`host`/`path`.
+    Udp,
+    /// The operating system's own resolver. Ignores every addressing field — useful because on many
+    /// networks the system resolver is simply not interfered with, and it costs nothing to try.
+    System,
+}
+
+impl Kind {
+    /// True if this transport encrypts the query, so the channel itself binds the response to it (and
+    /// a censor cannot forge an answer, only block). Plaintext kinds must instead rely on a random
+    /// transaction ID — see [`crate::codec::build_query_with_id`].
+    pub fn is_encrypted(self) -> bool {
+        matches!(self, Kind::Doh | Kind::Dot)
+    }
+
+    /// True if this kind dials a TLS stream, and therefore composes with opening-handshake
+    /// [`WirePlan`] shaping. Plaintext DNS has no ClientHello to fragment, and [`Kind::System`]
+    /// exposes no socket at all.
+    pub fn is_shapeable(self) -> bool {
+        self.is_encrypted()
+    }
+}
+
+/// One resolver, addressed for a fixed-IP dial. Fields are **owned** (not `&'static str`) so a
 /// pool can be decoded from an Ed25519-signed update at runtime (see [`crate::signed`]), not only
 /// baked in. Serializable for that signed-blob payload.
+///
+/// Which addressing fields apply depends on [`kind`](Self::kind) — the per-variant docs on [`Kind`]
+/// say which. Prefer the typed constructors ([`Resolver::doh`], [`dot`](Resolver::dot),
+/// [`udp`](Resolver::udp), [`tcp`](Resolver::tcp), [`system`](Resolver::system)) over a struct literal
+/// so unused fields are never filled in with something misleading.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Resolver {
     /// Short operator label (logs / metrics; never a secret).
     pub name: String,
-    /// The TCP endpoint to dial (the resolver IP, port 443).
+    /// Which DNS protocol this resolver speaks.
+    pub kind: Kind,
+    /// The endpoint to dial. Unused for [`Kind::System`].
     pub target: SocketAddr,
-    /// The SNI to present in the ClientHello (the resolver hostname, covered by its cert).
+    /// The SNI to present in the ClientHello (the resolver hostname, covered by its cert). Used by the
+    /// TLS-based kinds only.
     pub sni: String,
-    /// The DoH `:authority` (HTTP host) — the resolver hostname.
+    /// The DoH `:authority` (HTTP host) — the resolver hostname. [`Kind::Doh`] only.
     pub host: String,
-    /// The DoH path (RFC 8484), almost always `/dns-query`.
+    /// The DoH path (RFC 8484), almost always `/dns-query`. [`Kind::Doh`] only.
     pub path: String,
 }
 
 impl Resolver {
     /// The bootstrap-dial strategy for this resolver: boring Chrome-mimicry to its IP, presenting its
-    /// hostname as SNI, with no wire shaping (the dialer layers shaping on per network).
+    /// hostname as SNI, with **no** wire shaping. Shorthand for [`strategy_with`](Self::strategy_with)
+    /// and a default [`WirePlan`].
     pub fn strategy(&self) -> BootstrapStrategy {
-        BootstrapStrategy::boring_chrome(self.target, self.sni.clone())
+        self.strategy_with(WirePlan::default())
+    }
+
+    /// The bootstrap-dial strategy with opening-handshake shaping `wire` composed onto it.
+    ///
+    /// This is the composition seam between the two axes: the resolver says *where and how* to reach
+    /// DNS, `wire` says *how to shape the opening handshake* getting there. That is what makes
+    /// "DoH lookups carried over a fragmented, jittered ClientHello" expressible — the same shaping
+    /// vocabulary used for a destination dial, applied to the DNS dial itself.
+    ///
+    /// Shaping is only meaningful for the TLS-based kinds ([`Kind::is_shapeable`]); for plaintext or
+    /// system resolvers there is no ClientHello and `wire` is ignored by the query path.
+    pub fn strategy_with(&self, wire: WirePlan) -> BootstrapStrategy {
+        BootstrapStrategy::boring_chrome(self.target, self.sni.clone()).with_wire(wire)
+    }
+
+    /// A DNS-over-HTTPS resolver at `target`, presenting `sni`, querying `host``path`.
+    pub fn doh(
+        name: impl Into<String>,
+        target: SocketAddr,
+        sni: impl Into<String>,
+        host: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: Kind::Doh,
+            target,
+            sni: sni.into(),
+            host: host.into(),
+            path: path.into(),
+        }
+    }
+
+    /// A DNS-over-TLS resolver at `target` (conventionally port 853), presenting `sni`.
+    pub fn dot(name: impl Into<String>, target: SocketAddr, sni: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: Kind::Dot,
+            target,
+            sni: sni.into(),
+            host: String::new(),
+            path: String::new(),
+        }
+    }
+
+    /// A plaintext DNS-over-TCP resolver at `target` (conventionally port 53).
+    pub fn tcp(name: impl Into<String>, target: SocketAddr) -> Self {
+        Self::plain(name, Kind::Tcp, target)
+    }
+
+    /// A plaintext DNS-over-UDP resolver at `target` (conventionally port 53).
+    pub fn udp(name: impl Into<String>, target: SocketAddr) -> Self {
+        Self::plain(name, Kind::Udp, target)
+    }
+
+    fn plain(name: impl Into<String>, kind: Kind, target: SocketAddr) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            target,
+            sni: String::new(),
+            host: String::new(),
+            path: String::new(),
+        }
+    }
+
+    /// The OS resolver. Carries no addressing at all; `target` is an explicit unused placeholder.
+    pub fn system() -> Self {
+        Self {
+            name: "system".to_owned(),
+            kind: Kind::System,
+            target: SocketAddr::from(([0, 0, 0, 0], 0)),
+            sni: String::new(),
+            host: String::new(),
+            path: String::new(),
+        }
     }
 }
 
@@ -52,13 +177,7 @@ impl Resolver {
 /// fronting is blocked by some CDNs (Cloudflare/Google), so the default pool prefers `sni == host`
 /// CDN-edge entries.
 fn entry(name: &str, ip: [u8; 4], sni: &str, host: &str) -> Resolver {
-    Resolver {
-        name: name.to_owned(),
-        target: SocketAddr::from((ip, 443)),
-        sni: sni.to_owned(),
-        host: host.to_owned(),
-        path: "/dns-query".to_owned(),
-    }
+    Resolver::doh(name, SocketAddr::from((ip, 443)), sni, host, "/dns-query")
 }
 
 /// A plain raw-IP / CDN-edge entry (SNI == DoH host).
@@ -70,6 +189,13 @@ fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
 /// jurisdictions (US clouds, Swiss Quad9, Swedish Mullvad) — see the design's provider survey. The
 /// CDN-edge Cloudflare entries lead (the high-collateral spearhead). Quad9 uses the
 /// **no-threat-blocking** `9.9.9.10` so a flagged config host is never `NXDOMAIN`'d out from under us.
+///
+/// **Encrypted kinds only, on purpose.** [`Kind::Udp`]/[`Kind::Tcp`]/[`Kind::System`] answers are
+/// poisonable, and nothing in [`crate::resolve`] proves an answer is *correct* — [`crate::validate`]
+/// only rejects bogons, so a censor returning a plausible wrong IP would pass. Plaintext resolvers are
+/// therefore safe to try only where the answer gets verified end-to-end by actually completing a TLS
+/// handshake with a valid certificate against the resolved address (the proxyless strategy search).
+/// Callers who want them must add them explicitly rather than getting them by default here.
 pub fn default_pool() -> Vec<Resolver> {
     vec![
         // CDN-edge spearhead: Cloudflare runs its DoH resolver on the *same* global anycast edge that

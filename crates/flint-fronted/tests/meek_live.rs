@@ -94,6 +94,6 @@ async fn meek_live_auto_alpn_through_akamai_to_example_com() {
     assert!(
         text.starts_with("HTTP/1.1 200") && text.contains("Example Domain"),
         "unexpected response (first 200B): {:?}",
-        &text.chars().take(200).collect::<String>()
+        text.chars().take(200).collect::<String>()
     );
 }
