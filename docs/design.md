@@ -316,6 +316,41 @@ destination: this defeats *blocking*, not *observation*, and does nothing agains
 It is a reachability tool, not an anonymity one, and must not silently stand in for a proxy path a user
 believes is carrying their traffic.
 
+**As a Kindling race member (`ProxylessTransport`).** The bootstrap use case is a config fetch, so
+proxyless is registered alongside the fronted and direct-h2 transports and raced like any other: it
+costs no infrastructure and burns no fronting domains, so it is free to lose on an open network (where
+the direct dial wins) and earns its place where DNS is poisoned or the ClientHello is being classified.
+Here the target host is its own sufficient oracle, so `connect_cached` searches by attempting the *real*
+verified dial and returns the winning connection — one handshake per candidate instead of probe-then-dial,
+with the certificate check unchanged. (`find`'s multi-domain form still exists for the different question,
+"what works on this network".)
+
+One interaction needs care: the first connection on a new network is a **search**, not a dial, and can
+outlast `RaceOptions::attempt_timeout` (default 15s). Being killed mid-search is worse than slow, because
+no winner is recorded — so the cache stays empty and later attempts repeat the same cold search rather
+than benefiting from it. Whether they then succeed depends on candidate timing, so the failure is not
+strictly permanent; it is just uninformed, and a transport that keeps re-running a search it never gets to
+finish looks broken. Hence two knobs. `with_max_candidates` is a
+**strict** upper bound on candidates tried: resolvers are trimmed first, keeping every wire plan available
+while the budget allows — resolver diversity is the cheaper thing to lose, since the pool is deliberately
+redundant while each shaping plan is a distinct evasion strategy — and only a cap below the plan count
+sacrifices plans, keeping the first (cheapest) ones because enumeration is wire-major. `warm` runs the
+search outside any race so the first in-race connect is a single cached dial; prefer it over raising the
+timeout for every transport.
+
+Each attempt is separately bounded (5s), which matters more than it looks: a censor's usual move is to
+**blackhole** rather than refuse, and `flint_dial::dial` does not bound its TCP connect, so an unbounded
+candidate would hold its window slot indefinitely and stop the race refilling — the search would then wait
+on its least responsive candidate.
+
+That gives the budget a caller can actually compute, and the **stale-cache path is the case to size for**:
+a cached winner that has since been blocked costs one 5s attempt *before* the search starts, so the worst
+case is `5s + ceil(N / 4) × 5s`, not `ceil(N / 4) × 5s`. Against the 15s `RaceOptions` default that makes a
+cap of **4** the safe recommendation (5s + 5s = 10s); a cap of 8 totals exactly 15s and can be cancelled
+right at the boundary — precisely when it would otherwise have cached a new winner. Callers who want a
+wider search should raise the outer timeout or `warm` out of band rather than rely on the margin. This
+arithmetic is the whole reason the cap has to be strict rather than advisory.
+
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
 Browsers do DoH with *their own* ClientHello, so a generic (rustls) TLS stack doing DoH is **itself a

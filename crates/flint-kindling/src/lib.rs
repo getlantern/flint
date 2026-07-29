@@ -18,6 +18,12 @@ pub use flint_fronted::{
 pub mod fronted_bootstrap;
 pub use fronted_bootstrap::FrontedBootstrap;
 
+pub mod proxyless;
+pub use proxyless::ProxylessTransport;
+// So a caller can build a `Space` without taking its own `flint-proxyless` dependency, matching how the
+// fronted types are re-exported above.
+pub use flint_proxyless::{DialPolicy, Resolver, Space, StrategyCache, WirePlan};
+
 pub struct Kindling {
     transports: Vec<Box<dyn BoxedConnectionTransport>>,
     race_options: RaceOptions,
@@ -66,6 +72,21 @@ impl Kindling {
         R: FrontResolver + 'static,
     {
         self.with_transport(dialer)
+    }
+
+    /// Register a [`ProxylessTransport`], reaching the endpoint directly with no proxy and no exit hop
+    /// by searching for an un-poisoned resolver plus opening-handshake shaping the network does not
+    /// block.
+    ///
+    /// A good race member rather than a replacement: it costs no infrastructure and burns no fronting
+    /// domains, so it is free to lose on an open network (where the direct dial wins) and earns its
+    /// place where DNS is poisoned or the ClientHello is being classified.
+    ///
+    /// Mind the cold-start interaction with [`RaceOptions::attempt_timeout`] — the first connection on a
+    /// new network is a search, not a dial. See [`ProxylessTransport`] for the two mitigations
+    /// (`with_max_candidates` and `warm`).
+    pub fn with_proxyless(self, transport: ProxylessTransport) -> Self {
+        self.with_transport(transport)
     }
 
     pub fn with_fronted_tls_yaml(
@@ -154,6 +175,11 @@ impl Kindling {
         R: FrontResolver + 'static,
     {
         self.push_transport(dialer);
+    }
+
+    /// The `&mut` sibling of [`with_proxyless`](Self::with_proxyless).
+    pub fn push_proxyless(&mut self, transport: ProxylessTransport) {
+        self.push_transport(transport);
     }
 
     pub fn transport_count(&self) -> usize {
