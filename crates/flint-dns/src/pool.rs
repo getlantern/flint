@@ -18,8 +18,9 @@
 //! Ed25519-signed pool updates are layered on later (design §6).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use flint_dial::{BootstrapStrategy, WirePlan};
+use flint_dial::{BootstrapStrategy, CertVerification, WirePlan};
 
 /// Which DNS protocol a resolver speaks — the **DNS axis** of a proxyless strategy.
 ///
@@ -29,19 +30,15 @@ use flint_dial::{BootstrapStrategy, WirePlan};
 /// encrypted DNS while leaving plaintext queries to an unfiltered resolver alone. They are deliberately
 /// absent from [`default_pool`] — see that function for why.
 ///
-/// <div class="warning">
+/// **Encryption is not authentication**, so the encrypted kinds are also *authenticated*: every TLS
+/// resolver dial verifies the certificate chain and hostname ([`Resolver::tls_strategy_with`]). Without
+/// that, an on-path attacker could terminate the handshake with any certificate and return forged
+/// answers over a perfectly encrypted channel — the very poisoning DoH exists to prevent. With it, the
+/// encrypted kinds resist an active on-path MITM as well as passive reading and off-path forgery.
 ///
-/// **Encryption is not authentication, and the default strategy does not authenticate.**
-/// [`Resolver::strategy`] builds on [`BootstrapStrategy::boring_chrome`], whose
-/// `verification` is [`CertVerification::None`](flint_dial::CertVerification::None) — the peer
-/// certificate and hostname are *not* checked. So an **on-path** attacker can complete the handshake
-/// with any certificate it likes and hand back forged answers over a perfectly encrypted channel. The
-/// encrypted kinds therefore resist *off-path* forgery and passive reading, not an active on-path
-/// MITM, until a caller supplies [`CertVerification::Roots`](flint_dial::CertVerification::Roots) via
-/// [`BootstrapStrategy::with_verification`]. Tracked as a follow-up; `flint-fronted` already does this
-/// for its dials.
-///
-/// </div>
+/// The plaintext kinds cannot be authenticated at all, which is the real reason they sit outside
+/// [`default_pool`]: their answers are only trustworthy once something downstream proves them, which is
+/// what the proxyless search does by requiring a verified handshake to the resolved address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// DNS-over-HTTPS (RFC 8484) over HTTP/2, port 443. Uses `sni`, `host`, and `path`.
@@ -64,9 +61,9 @@ impl Kind {
     /// **off-path** attacker cannot forge an answer. Plaintext kinds must instead rely on a random
     /// transaction ID — see [`crate::codec::build_query_with_id`].
     ///
-    /// This says nothing about an **on-path** attacker: with the default
-    /// [`CertVerification::None`](flint_dial::CertVerification::None) the peer is unauthenticated, so
-    /// encryption alone does not make the answer trustworthy. See the [`Kind`] docs.
+    /// An **on-path** attacker is held off by authentication rather than encryption: these kinds dial
+    /// with certificate and hostname verification ([`Resolver::tls_strategy_with`]), so a MITM cannot
+    /// substitute its own answers either.
     pub fn is_encrypted(self) -> bool {
         matches!(self, Kind::Doh | Kind::Dot)
     }
@@ -104,32 +101,92 @@ pub struct Resolver {
     pub path: String,
 }
 
-impl Resolver {
-    /// The TLS dial strategy for this resolver — boring Chrome-mimicry to its IP presenting its
-    /// hostname as SNI — with **no** wire shaping, or `None` if this [`Kind`] has no TLS dial.
-    /// Shorthand for [`tls_strategy_with`](Self::tls_strategy_with) and a default [`WirePlan`].
-    pub fn tls_strategy(&self) -> Option<BootstrapStrategy> {
-        self.tls_strategy_with(WirePlan::default())
+/// How a resolver dial is **shaped** and **trusted**.
+///
+/// Bundling the two keeps the resolve signatures stable as knobs are added, and makes the trust
+/// decision something a caller states rather than something it inherits by accident — which is exactly
+/// how the dial went unauthenticated before (see [`Resolver::tls_strategy_with`]).
+#[derive(Debug, Clone, Default)]
+pub struct DialPolicy {
+    /// Opening-handshake shaping (the shaping axis; see [`Resolver::tls_strategy_with`]).
+    pub wire: WirePlan,
+    /// PEM trust anchors used to verify the resolver's certificate.
+    ///
+    /// Empty (the default) means the platform's default store — on desktop the system roots, and on
+    /// mobile whatever the embedder has pointed `SSL_CERT_FILE`/`SSL_CERT_DIR` at, since Android and
+    /// iOS keep their trust roots where OpenSSL's default paths cannot see them. An embedder that
+    /// bundles its own anchor set can pin it here instead.
+    ///
+    /// `Arc` because one root set is shared across every resolver in a pool: cloning it per dial is a
+    /// refcount bump, not a copy of the PEM data.
+    pub roots: Arc<[String]>,
+}
+
+impl DialPolicy {
+    /// A policy with shaping `wire` and the platform default trust store.
+    pub fn shaped(wire: WirePlan) -> Self {
+        Self {
+            wire,
+            roots: Arc::from(Vec::new()),
+        }
     }
 
-    /// The TLS dial strategy with opening-handshake shaping `wire` composed onto it, or `None` if this
-    /// [`Kind`] has no TLS dial to describe.
+    /// Pin the PEM trust anchors (builder style). Empty means the platform default store.
+    pub fn with_roots(mut self, roots: Arc<[String]>) -> Self {
+        self.roots = roots;
+        self
+    }
+}
+
+impl Resolver {
+    /// The TLS dial strategy for this resolver — boring Chrome-mimicry to its IP presenting its
+    /// hostname as SNI, **certificate-verified** — with no wire shaping, or `None` if this [`Kind`] has
+    /// no TLS dial. Shorthand for [`tls_strategy_with`](Self::tls_strategy_with) and a default
+    /// [`DialPolicy`].
+    pub fn tls_strategy(&self) -> Option<BootstrapStrategy> {
+        self.tls_strategy_with(&DialPolicy::default())
+    }
+
+    /// The TLS dial strategy under `policy` — its shaping composed on and its trust anchors applied —
+    /// or `None` if this [`Kind`] has no TLS dial to describe.
     ///
     /// This is the composition seam between the two axes: the resolver says *where and how* to reach
-    /// DNS, `wire` says *how to shape the opening handshake* getting there. That is what makes
+    /// DNS, `policy.wire` says *how to shape the opening handshake* getting there. That is what makes
     /// "DoH lookups carried over a fragmented, jittered ClientHello" expressible — the same shaping
     /// vocabulary used for a destination dial, applied to the DNS dial itself.
+    ///
+    /// # The dial is verified, and the identity is the SNI
+    ///
+    /// Verification is [`CertVerification::Roots`] — chain **and** hostname — never
+    /// [`None`](flint_dial::CertVerification::None). Encryption without authentication bought nothing
+    /// here: an on-path attacker could terminate the handshake with any certificate and hand back
+    /// forged answers, which is precisely the poisoning DoH is supposed to prevent.
+    ///
+    /// The verified identity is [`sni`](Self::sni), not [`host`](Self::host), because the SNI is by
+    /// definition the name whose certificate the server will present. For the ordinary raw-IP and
+    /// CDN-edge entries the two are equal, so this is just "verify the resolver hostname" — and it
+    /// works despite dialing a bare IP because the identity checked is the hostname, not the address.
+    /// For a *fronted* entry (`sni != host`) the front's certificate is what arrives, so that is what
+    /// gets authenticated; the real resolver is then addressed by `:authority` **inside** the verified
+    /// channel, which is the trust model domain fronting always relies on.
     ///
     /// Returns `None` for every non-TLS kind ([`Kind::is_shapeable`]): plaintext TCP/UDP dial no TLS at
     /// all, and [`Kind::System`] carries no endpoint (its `target` is an unused placeholder, so a
     /// strategy would describe a dial to `0.0.0.0:0`). Handing back `Option` keeps that invalid
     /// combination unrepresentable at the call site instead of trusting each caller to check `kind`
     /// first — the same reason the constructors above exist.
-    pub fn tls_strategy_with(&self, wire: WirePlan) -> Option<BootstrapStrategy> {
+    pub fn tls_strategy_with(&self, policy: &DialPolicy) -> Option<BootstrapStrategy> {
         if !self.kind.is_shapeable() {
             return None;
         }
-        Some(BootstrapStrategy::boring_chrome(self.target, self.sni.clone()).with_wire(wire))
+        Some(
+            BootstrapStrategy::boring_chrome(self.target, self.sni.clone())
+                .with_wire(policy.wire.clone())
+                .with_verification(CertVerification::Roots {
+                    roots_pem: policy.roots.clone(),
+                    hostname: self.sni.clone(),
+                }),
+        )
     }
 
     /// A DNS-over-HTTPS resolver at `target`, presenting `sni`, querying `path` on `host`.
@@ -223,9 +280,9 @@ fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
 /// proxyless strategy search). Callers who want them must add them explicitly rather than getting them
 /// by default here.
 ///
-/// Note this is a *relative* preference, not a clean bill of health: while the dial stays on
-/// [`CertVerification::None`](flint_dial::CertVerification::None) the entries below are unauthenticated
-/// too, so they resist off-path forgery rather than an on-path MITM. See [`Kind`].
+/// The entries below are, by contrast, both encrypted *and* authenticated — every dial verifies the
+/// certificate chain and hostname ([`Resolver::tls_strategy_with`]) — so a poisoned answer cannot reach
+/// [`crate::validate`] in the first place. See [`Kind`].
 pub fn default_pool() -> Vec<Resolver> {
     vec![
         // CDN-edge spearhead: Cloudflare runs its DoH resolver on the *same* global anycast edge that
@@ -345,10 +402,10 @@ mod tests {
             assert!(s.wire.is_noop(), "default strategy applies no shaping");
         }
         let shaped = doh
-            .tls_strategy_with(WirePlan {
+            .tls_strategy_with(&DialPolicy::shaped(WirePlan {
                 record_fragment: RecordFragment::SniStraddle,
                 ..Default::default()
-            })
+            }))
             .expect("shaping composes onto a TLS kind");
         assert!(!shaped.wire.is_noop(), "the wire plan must be carried");
 
@@ -365,6 +422,74 @@ mod tests {
                 "{:?} must not produce a TLS strategy",
                 r.kind
             );
+        }
+    }
+
+    #[test]
+    fn every_tls_dial_verifies_the_certificate_against_the_sni() {
+        // The regression this guards: `boring_chrome` defaults to CertVerification::None, so a
+        // strategy that merely inherits it is encrypted but unauthenticated — an on-path MITM could
+        // terminate the handshake with any certificate and inject answers.
+        let doh = Resolver::doh(
+            "q",
+            "9.9.9.10:443".parse().unwrap(),
+            "dns.quad9.net",
+            "dns.quad9.net",
+            "/dns-query",
+        );
+        let dot = Resolver::dot("q-dot", "9.9.9.10:853".parse().unwrap(), "dns.quad9.net");
+
+        for r in [&doh, &dot] {
+            let s = r.tls_strategy().expect("a TLS kind has a strategy");
+            match &s.verification {
+                CertVerification::Roots {
+                    roots_pem,
+                    hostname,
+                } => {
+                    // The identity checked is the SNI — the name whose cert the server presents.
+                    assert_eq!(hostname, &r.sni);
+                    assert!(!hostname.is_empty(), "a verified dial requires a hostname");
+                    // Empty anchors mean the platform default store, not "skip verification".
+                    assert!(roots_pem.is_empty());
+                }
+                CertVerification::None => {
+                    panic!("{:?} dial must not be unauthenticated", r.kind)
+                }
+            }
+        }
+
+        // Pinned anchors are carried through instead of the platform store.
+        let pinned: Arc<[String]> = Arc::from(vec!["-----BEGIN CERTIFICATE-----".to_string()]);
+        let s = doh
+            .tls_strategy_with(&DialPolicy::default().with_roots(pinned.clone()))
+            .expect("a TLS kind has a strategy");
+        match &s.verification {
+            CertVerification::Roots { roots_pem, .. } => assert_eq!(roots_pem, &pinned),
+            CertVerification::None => panic!("pinned roots must still verify"),
+        }
+    }
+
+    /// A fronted entry (`sni != host`) authenticates the **front**, since that is whose certificate
+    /// arrives; the real resolver is then addressed by `:authority` inside the verified channel.
+    #[test]
+    fn a_fronted_entry_verifies_the_front_not_the_doh_authority() {
+        let fronted = Resolver::doh(
+            "fronted",
+            "104.16.249.249:443".parse().unwrap(),
+            "camouflage.example",
+            "cloudflare-dns.com",
+            "/dns-query",
+        );
+        let s = fronted.tls_strategy().expect("DoH has a strategy");
+        assert_eq!(s.sni, "camouflage.example");
+        match &s.verification {
+            CertVerification::Roots { hostname, .. } => {
+                assert_eq!(
+                    hostname, "camouflage.example",
+                    "verifying the DoH :authority would fail — the front serves its own cert"
+                );
+            }
+            CertVerification::None => panic!("a fronted dial must still be authenticated"),
         }
     }
 
