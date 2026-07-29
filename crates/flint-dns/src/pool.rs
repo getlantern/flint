@@ -105,27 +105,34 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// The bootstrap-dial strategy for this resolver: boring Chrome-mimicry to its IP, presenting its
-    /// hostname as SNI, with **no** wire shaping. Shorthand for [`strategy_with`](Self::strategy_with)
-    /// and a default [`WirePlan`].
-    pub fn strategy(&self) -> BootstrapStrategy {
-        self.strategy_with(WirePlan::default())
+    /// The TLS dial strategy for this resolver — boring Chrome-mimicry to its IP presenting its
+    /// hostname as SNI — with **no** wire shaping, or `None` if this [`Kind`] has no TLS dial.
+    /// Shorthand for [`tls_strategy_with`](Self::tls_strategy_with) and a default [`WirePlan`].
+    pub fn tls_strategy(&self) -> Option<BootstrapStrategy> {
+        self.tls_strategy_with(WirePlan::default())
     }
 
-    /// The bootstrap-dial strategy with opening-handshake shaping `wire` composed onto it.
+    /// The TLS dial strategy with opening-handshake shaping `wire` composed onto it, or `None` if this
+    /// [`Kind`] has no TLS dial to describe.
     ///
     /// This is the composition seam between the two axes: the resolver says *where and how* to reach
     /// DNS, `wire` says *how to shape the opening handshake* getting there. That is what makes
     /// "DoH lookups carried over a fragmented, jittered ClientHello" expressible — the same shaping
     /// vocabulary used for a destination dial, applied to the DNS dial itself.
     ///
-    /// Shaping is only meaningful for the TLS-based kinds ([`Kind::is_shapeable`]); for plaintext or
-    /// system resolvers there is no ClientHello and `wire` is ignored by the query path.
-    pub fn strategy_with(&self, wire: WirePlan) -> BootstrapStrategy {
-        BootstrapStrategy::boring_chrome(self.target, self.sni.clone()).with_wire(wire)
+    /// Returns `None` for every non-TLS kind ([`Kind::is_shapeable`]): plaintext TCP/UDP dial no TLS at
+    /// all, and [`Kind::System`] carries no endpoint (its `target` is an unused placeholder, so a
+    /// strategy would describe a dial to `0.0.0.0:0`). Handing back `Option` keeps that invalid
+    /// combination unrepresentable at the call site instead of trusting each caller to check `kind`
+    /// first — the same reason the constructors above exist.
+    pub fn tls_strategy_with(&self, wire: WirePlan) -> Option<BootstrapStrategy> {
+        if !self.kind.is_shapeable() {
+            return None;
+        }
+        Some(BootstrapStrategy::boring_chrome(self.target, self.sni.clone()).with_wire(wire))
     }
 
-    /// A DNS-over-HTTPS resolver at `target`, presenting `sni`, querying `host``path`.
+    /// A DNS-over-HTTPS resolver at `target`, presenting `sni`, querying `path` on `host`.
     pub fn doh(
         name: impl Into<String>,
         target: SocketAddr,
@@ -300,6 +307,8 @@ pub fn default_pool() -> Vec<Resolver> {
 
 #[cfg(test)]
 mod tests {
+    use flint_dial::RecordFragment;
+
     use super::*;
 
     #[test]
@@ -311,11 +320,52 @@ mod tests {
             assert!(r.target.ip().is_ipv4());
             assert!(!r.sni.is_empty() && r.host == r.sni);
             assert_eq!(r.path, "/dns-query");
-            assert_eq!(r.strategy().engine.kind(), "boring-chrome");
+            // Every default entry is an encrypted kind, so each has a TLS strategy.
+            assert_eq!(r.kind, Kind::Doh);
+            let strategy = r.tls_strategy().expect("a DoH resolver has a TLS strategy");
+            assert_eq!(strategy.engine.kind(), "boring-chrome");
         }
         // Operator diversity (not all one provider).
         let hosts: std::collections::HashSet<_> = pool.iter().map(|r| r.host.as_str()).collect();
         assert!(hosts.len() >= 4, "pool should span several operators");
+    }
+
+    #[test]
+    fn only_tls_kinds_have_a_dial_strategy() {
+        let addr = "9.9.9.10:443".parse().unwrap();
+
+        // TLS kinds: a strategy, carrying the SNI and any shaping asked for.
+        let doh = Resolver::doh("q", addr, "dns.quad9.net", "dns.quad9.net", "/dns-query");
+        let dot = Resolver::dot("q-dot", "9.9.9.10:853".parse().unwrap(), "dns.quad9.net");
+        for r in [&doh, &dot] {
+            let s = r
+                .tls_strategy()
+                .expect("a TLS kind must have a dial strategy");
+            assert_eq!(s.sni, "dns.quad9.net");
+            assert!(s.wire.is_noop(), "default strategy applies no shaping");
+        }
+        let shaped = doh
+            .tls_strategy_with(WirePlan {
+                record_fragment: RecordFragment::SniStraddle,
+                ..Default::default()
+            })
+            .expect("shaping composes onto a TLS kind");
+        assert!(!shaped.wire.is_noop(), "the wire plan must be carried");
+
+        // Non-TLS kinds have none — the invalid combination is unrepresentable, so nothing can
+        // accidentally dial TLS to a plaintext resolver or to System's placeholder 0.0.0.0:0.
+        let plaintext = "9.9.9.10:53".parse().unwrap();
+        for r in [
+            Resolver::tcp("q-tcp", plaintext),
+            Resolver::udp("q-udp", plaintext),
+            Resolver::system(),
+        ] {
+            assert!(
+                r.tls_strategy().is_none(),
+                "{:?} must not produce a TLS strategy",
+                r.kind
+            );
+        }
     }
 
     #[test]

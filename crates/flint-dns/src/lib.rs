@@ -100,14 +100,14 @@ pub async fn resolve_one_shaped(
     let answers = match resolver.kind {
         Kind::Doh => {
             let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
-            let stream = flint_dial::dial(&resolver.strategy_with(wire.clone())).await?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
             let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
             codec::parse_response(&response).map_err(io::Error::other)?
         }
         Kind::Dot => {
             let id = random_id()?;
             let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
-            let stream = flint_dial::dial(&resolver.strategy_with(wire.clone())).await?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
             let response = plain::query_stream(stream, &query).await?;
             codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
         }
@@ -127,6 +127,20 @@ pub async fn resolve_one_shaped(
         Kind::System => system_lookup(name, qtype).await?,
     };
     validate::validate_answers(answers).map_err(io::Error::other)
+}
+
+/// The TLS strategy for a resolver whose kind is known to be TLS-based.
+///
+/// The `Doh`/`Dot` match arms have already established that, so `None` here would mean
+/// [`Kind::is_shapeable`] and this dispatch disagree — a bug, not a runtime condition. Surfacing it as
+/// an error rather than unwrapping keeps that impossible case from becoming a panic.
+fn tls_strategy(resolver: &Resolver, wire: &WirePlan) -> io::Result<flint_dial::BootstrapStrategy> {
+    resolver.tls_strategy_with(wire.clone()).ok_or_else(|| {
+        io::Error::other(format!(
+            "resolver {} has kind {:?}, which has no TLS dial strategy",
+            resolver.name, resolver.kind
+        ))
+    })
 }
 
 /// A CSPRNG-drawn DNS transaction ID. Uses `ring` like the rest of flint rather than adding an RNG.
