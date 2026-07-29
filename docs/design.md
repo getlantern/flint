@@ -271,6 +271,38 @@ to verify is the **real host** for plain/CDN-edge entries (where `sni == host`) 
 any fronted entry, whose cert matches the camouflage SNI rather than the DoH `:authority`. Tracked in
 §11.
 
+### 6.2 Proxyless: searching `resolver × wire` (`flint-proxyless`)
+
+The axes in §6.1 exist to be *searched*. `flint-proxyless` is the second `BootstrapDial` consumer and
+the Rust counterpart to the Outline SDK smart dialer's proxyless path (`x/smart`, `findDNS × findTLS`):
+reach the **real destination** with no proxy and no exit hop, by finding a `(resolver, wire)` pairing the
+local network does not block.
+
+A `Strategy` is one point in the product; a `Space` declares the candidates. Enumeration is
+**wire-major** — every resolver against the no-op plan first, then against each shaping plan in turn —
+so "is any resolver reachable with no shaping at all" is settled before paying for shaping, mirroring
+the smart dialer's instinct of resolving DNS before searching TLS transports. Candidates race with a
+small bounded window (4): each probe is a real lookup plus a real handshake, and firing dozens at once
+would be slow, wasteful, and conspicuous precisely where someone is watching.
+
+**The certificate is the oracle.** A censor can block a connection, and can answer a plaintext query
+with anything it likes, but it cannot produce a valid certificate for the destination. So the success
+test is not "DNS answered" or "TCP connected" but *did a TLS handshake to the resolved address complete
+against a verified chain and hostname*. Every dial in this crate — probe and destination alike — uses
+`CertVerification::Roots`; an unverified dial would destroy the property the whole design rests on.
+
+That oracle is what admits the poisonable resolver kinds here even though `default_pool()` excludes
+them (§6.1): a forged answer cannot survive the handshake, so a poisoned resolver loses the race rather
+than silently winning it. A search must reach **all** test domains, not any, so one accidentally-open
+path cannot vouch for a hostile network. And a cached winner is **re-verified rather than trusted** —
+what worked yesterday may be blocked today, so a caught strategy self-heals into a fresh search instead
+of pinning the client to a dead path.
+
+**Scope, stated plainly.** No exit hop means traffic leaves the user's own address for the real
+destination: this defeats *blocking*, not *observation*, and does nothing against IP-level blackholing.
+It is a reachability tool, not an anonymity one, and must not silently stand in for a proxy path a user
+believes is carrying their traffic.
+
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
 Browsers do DoH with *their own* ClientHello, so a generic (rustls) TLS stack doing DoH is **itself a
