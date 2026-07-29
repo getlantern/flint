@@ -38,7 +38,13 @@ impl Entry {
         let wire = space.wires.get(self.wire)?;
         Some(Strategy {
             resolver: resolver.clone(),
-            wire: wire.clone(),
+            // Trust comes from the current space, never from the cached entry: a persisted anchor set
+            // could be stale or (if the cache is ever loaded from disk) attacker-influenced, and trust
+            // is not something a cache should get a vote on.
+            policy: flint_dns::DialPolicy {
+                wire: wire.clone(),
+                roots: space.roots.clone(),
+            },
         })
     }
 }
@@ -137,7 +143,22 @@ mod tests {
         .resolve(&space)
         .expect("beta with wire 1 is in the space");
         assert_eq!(strategy.resolver.name, "beta");
-        assert!(!strategy.wire.is_noop(), "wire 1 is the shaped plan");
+        assert!(!strategy.policy.wire.is_noop(), "wire 1 is the shaped plan");
+    }
+
+    #[test]
+    fn trust_comes_from_the_space_not_the_cached_entry() {
+        let pinned: std::sync::Arc<[String]> =
+            std::sync::Arc::from(vec!["-----BEGIN CERTIFICATE-----".to_string()]);
+        let space = space().with_roots(pinned.clone());
+        let strategy = Entry {
+            resolver: "alpha".into(),
+            wire: 0,
+        }
+        .resolve(&space)
+        .expect("alpha with wire 0 is in the space");
+        // A cache entry names a candidate; it never carries trust anchors of its own.
+        assert_eq!(strategy.policy.roots, pinned);
     }
 
     #[test]

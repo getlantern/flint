@@ -42,7 +42,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flint_dial::{BootstrapStrategy, BoxedTlsStream, CertVerification, WirePlan};
-use flint_dns::{Resolver, TYPE_A};
+use flint_dns::{DialPolicy, Resolver, TYPE_A};
 
 pub mod cache;
 
@@ -86,14 +86,14 @@ pub enum FindError {
     },
 }
 
-/// One point in the search space: how to learn an address, and how to shape the handshake.
+/// One point in the search space: how to learn an address, and how to shape and trust the handshake.
 #[derive(Debug, Clone)]
 pub struct Strategy {
     /// The DNS axis — which resolver and protocol to learn the destination address from.
     pub resolver: Resolver,
-    /// The shaping axis — how to shape the opening handshake, both to the resolver (when its kind is
-    /// TLS-based) and to the destination.
-    pub wire: WirePlan,
+    /// The shaping axis plus the trust anchors, reusing [`DialPolicy`] so the resolver dial and the
+    /// destination dial are shaped and verified the same way from one value.
+    pub policy: DialPolicy,
 }
 
 /// The declared candidate space: every `resolver × wire` pairing.
@@ -109,6 +109,10 @@ pub struct Space {
     pub resolvers: Vec<Resolver>,
     /// Candidate wire plans (the shaping axis).
     pub wires: Vec<WirePlan>,
+    /// PEM trust anchors for every dial this space produces. Empty means the platform default store;
+    /// an embedder that bundles its own anchors (as mobile builds must) pins them here. Not an axis —
+    /// trust is a deployment fact, not something to search over.
+    pub roots: Arc<[String]>,
 }
 
 impl Space {
@@ -117,7 +121,15 @@ impl Space {
         Self {
             resolvers,
             wires: vec![WirePlan::default()],
+            roots: Arc::from(Vec::new()),
         }
+    }
+
+    /// Pin the PEM trust anchors used by every dial (builder style). Empty means the platform default
+    /// store.
+    pub fn with_roots(mut self, roots: Arc<[String]>) -> Self {
+        self.roots = roots;
+        self
     }
 
     /// Add a wire plan to the shaping axis (builder style).
@@ -144,7 +156,10 @@ impl Space {
         }
         Some(Strategy {
             resolver: self.resolvers[index % n].clone(),
-            wire: self.wires[index / n].clone(),
+            policy: DialPolicy {
+                wire: self.wires[index / n].clone(),
+                roots: self.roots.clone(),
+            },
         })
     }
 
@@ -324,7 +339,7 @@ where
 /// Requires the `boring` feature; without it [`flint_dial::dial`] reports the engine unsupported.
 pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
     let addr = resolve_first(strategy, domain).await?;
-    let _stream = flint_dial::dial(&verified(addr, domain, &strategy.wire)).await?;
+    let _stream = flint_dial::dial(&verified(addr, domain, &strategy.policy)).await?;
     Ok(())
 }
 
@@ -335,13 +350,13 @@ pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
 /// protocol over (an HTTP/2 config fetch, say).
 pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<BoxedTlsStream> {
     let ip = resolve_first(strategy, host).await?.ip();
-    flint_dial::dial(&verified(SocketAddr::new(ip, port), host, &strategy.wire)).await
+    flint_dial::dial(&verified(SocketAddr::new(ip, port), host, &strategy.policy)).await
 }
 
 /// Resolve `host` through `strategy`'s resolver and return its first address at [`PROBE_PORT`].
 async fn resolve_first(strategy: &Strategy, host: &str) -> io::Result<SocketAddr> {
     let addrs =
-        flint_dns::resolve_one_shaped(&strategy.resolver, host, TYPE_A, &strategy.wire).await?;
+        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy).await?;
     let ip = addrs.first().copied().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -354,16 +369,18 @@ async fn resolve_first(strategy: &Strategy, host: &str) -> io::Result<SocketAddr
     Ok(SocketAddr::new(ip, PROBE_PORT))
 }
 
-/// A dial strategy to `target` that **verifies** the peer against `hostname`, with `wire` shaping.
+/// A dial strategy to `target` that **verifies** the peer against `hostname`, shaped by `policy.wire`
+/// and anchored by `policy.roots`.
 ///
-/// Empty `roots_pem` means the platform's system roots. Unlike the resolver dial in `flint-dns` (which
-/// still inherits `CertVerification::None` — design §11), nothing here is ever unverified: an
-/// unauthenticated dial would destroy the oracle this crate is built on.
-fn verified(target: SocketAddr, hostname: &str, wire: &WirePlan) -> BootstrapStrategy {
+/// Nothing here is ever unverified — an unauthenticated dial would destroy the oracle this crate is
+/// built on — and `flint-dns` now holds its resolver dials to the same standard, so both legs of a
+/// proxyless connection are authenticated. Note the two legs verify *different* identities: the
+/// resolver leg checks the resolver's SNI, this one checks the destination host.
+fn verified(target: SocketAddr, hostname: &str, policy: &DialPolicy) -> BootstrapStrategy {
     BootstrapStrategy::boring_chrome(target, hostname)
-        .with_wire(wire.clone())
+        .with_wire(policy.wire.clone())
         .with_verification(CertVerification::Roots {
-            roots_pem: Arc::from(Vec::new()),
+            roots_pem: policy.roots.clone(),
             hostname: hostname.to_owned(),
         })
 }
@@ -411,7 +428,7 @@ mod tests {
         let names: Vec<_> = (0..6)
             .map(|i| {
                 let s = space.strategy(i).unwrap();
-                (s.resolver.name, s.wire.is_noop())
+                (s.resolver.name, s.policy.wire.is_noop())
             })
             .collect();
         assert_eq!(
@@ -439,7 +456,7 @@ mod tests {
             &space,
             &domains(&["a.test", "b.test"]),
             |s, _d| async move {
-                if s.resolver.name == "r2" && !s.wire.is_noop() {
+                if s.resolver.name == "r2" && !s.policy.wire.is_noop() {
                     Ok(())
                 } else {
                     Err(io::Error::other("blocked"))
@@ -449,7 +466,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.resolver.name, "r2");
-        assert!(!found.wire.is_noop());
+        assert!(!found.policy.wire.is_noop());
     }
 
     #[tokio::test]
@@ -552,7 +569,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.resolver.name, "r1");
-        assert!(!found.wire.is_noop());
+        assert!(!found.policy.wire.is_noop());
         // Exactly one probe: the cached candidate was re-verified, and no search ran.
         assert_eq!(probed.lock().unwrap().clone(), vec!["r1".to_string()]);
     }
@@ -602,7 +619,7 @@ mod tests {
 
         find_cached_with(&space, &domains(&["a.test"]), &cache, "wifi", |s, _d| {
             // Only the shaped plan on r1 works — index 3 in wire-major order.
-            let ok = s.resolver.name == "r1" && !s.wire.is_noop();
+            let ok = s.resolver.name == "r1" && !s.policy.wire.is_noop();
             async move {
                 if ok {
                     Ok(())

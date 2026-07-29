@@ -7,19 +7,20 @@
 //! leaving it the blunter option of blocking the connection — "uncensored DNS" largely reduces to
 //! "reach *one* resolver", which is exactly what the raced bootstrap dials are for.
 //!
-//! **Caveat, and it is a real one:** the default dial does not authenticate the resolver
-//! ([`CertVerification::None`](flint_dial::CertVerification::None) via
-//! [`BootstrapStrategy::boring_chrome`](flint_dial::BootstrapStrategy::boring_chrome)), so an
-//! **on-path** attacker can terminate TLS with any certificate and inject answers. [`validate`] would
-//! catch a clumsy sentinel but not a plausible attacker-chosen address. Callers wanting that closed
-//! must pass [`CertVerification::Roots`](flint_dial::CertVerification::Roots); see [`Kind`].
+//! **Encrypted is not enough on its own, so the dial is also authenticated:** every TLS resolver dial
+//! verifies the certificate chain and hostname ([`Resolver::tls_strategy_with`]). Otherwise an on-path
+//! attacker could terminate TLS with any certificate and inject answers, and [`validate`] would catch a
+//! clumsy sentinel but not a plausible attacker-chosen address. Trust anchors come from
+//! [`DialPolicy::roots`] — empty means the platform default store, which on mobile is whatever the
+//! embedder pointed `SSL_CERT_FILE` at.
 //!
 //! **Two independent axes.** A resolver's [`Kind`] picks the DNS protocol and endpoint (DoH, DoT,
 //! plaintext TCP/UDP, or the system resolver); a [`WirePlan`] picks how the opening handshake looks on
-//! the wire (record fragmentation, segment splitting, inter-segment jitter). [`resolve_one_shaped`]
-//! composes them, so a DoH lookup can itself be carried over a fragmented, jittered ClientHello — the
-//! same shaping vocabulary used for a destination dial, aimed at the DNS dial. Encrypted kinds are the
-//! trustworthy ones; the plaintext kinds are poisonable and stay out of [`default_pool`] (see there).
+//! the wire (record fragmentation, segment splitting, inter-segment jitter). [`resolve_one_with`]
+//! composes them via [`DialPolicy`], so a DoH lookup can itself be carried over a fragmented, jittered
+//! ClientHello — the same shaping vocabulary used for a destination dial, aimed at the DNS dial.
+//! Encrypted kinds are the trustworthy ones; the plaintext kinds are poisonable and stay out of
+//! [`default_pool`] (see there).
 //!
 //! Build pieces: [`codec`] (minimal A/AAAA wire codec), [`validate`] (poison rejection), [`pool`]
 //! (the diverse resolver set + the [`Kind`] axis), [`doh`] (DoH-over-h2), [`plain`] (DoT/TCP framing +
@@ -44,7 +45,7 @@ pub mod validate;
 pub use cache::ResolverCache;
 pub use codec::{TYPE_A, TYPE_AAAA};
 pub use flint_dial::WirePlan;
-pub use pool::{default_pool, Kind, Resolver};
+pub use pool::{default_pool, DialPolicy, Kind, Resolver};
 pub use signed::{load_signed_pool, PoolUpdate};
 
 /// Why a resolution failed.
@@ -73,41 +74,43 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`Kind`] names, run the query, parse, and validate. Returns the validated public addresses, or an
 /// `io::Error` (which the smart-dialer funnels into the race's per-resolver failures).
 ///
-/// Applies no opening-handshake shaping; see [`resolve_one_shaped`].
+/// Applies no shaping and trusts the platform default store; see [`resolve_one_with`].
 pub async fn resolve_one(resolver: &Resolver, name: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-    resolve_one_shaped(resolver, name, qtype, &WirePlan::default()).await
+    resolve_one_with(resolver, name, qtype, &DialPolicy::default()).await
 }
 
-/// Like [`resolve_one`], but composes opening-handshake shaping `wire` onto the dial that reaches the
-/// resolver.
+/// Like [`resolve_one`], but under an explicit [`DialPolicy`] — shaping composed onto the dial that
+/// reaches the resolver, and the trust anchors used to verify it.
 ///
 /// This is the seam that makes the two axes independent: `resolver` picks *which DNS protocol and
-/// endpoint*, `wire` picks *how the opening handshake looks on the wire* (record fragmentation, segment
-/// splitting, inter-segment jitter). So a DoH lookup can itself be carried over a fragmented, jittered
-/// ClientHello — the same shaping vocabulary applied to a destination dial, pointed at the DNS dial.
+/// endpoint*, `policy.wire` picks *how the opening handshake looks on the wire* (record fragmentation,
+/// segment splitting, inter-segment jitter). So a DoH lookup can itself be carried over a fragmented,
+/// jittered ClientHello — the same shaping vocabulary applied to a destination dial, pointed at the DNS
+/// dial.
 ///
-/// `wire` is ignored for kinds that expose no ClientHello to shape ([`Kind::is_shapeable`]).
+/// `policy.wire` is ignored for kinds that expose no ClientHello to shape ([`Kind::is_shapeable`]), and
+/// `policy.roots` for those that run no TLS at all.
 ///
 /// Transaction IDs: DoH uses ID 0 per RFC 8484 §4.1, since its own framing binds the response. Every
 /// other transport draws a random ID and verifies it on return — mandatory for the plaintext kinds,
 /// harmless for DoT.
-pub async fn resolve_one_shaped(
+pub async fn resolve_one_with(
     resolver: &Resolver,
     name: &str,
     qtype: u16,
-    wire: &WirePlan,
+    policy: &DialPolicy,
 ) -> io::Result<Vec<IpAddr>> {
     let answers = match resolver.kind {
         Kind::Doh => {
             let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
-            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, policy)?).await?;
             let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
             codec::parse_response(&response).map_err(io::Error::other)?
         }
         Kind::Dot => {
             let id = random_id()?;
             let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
-            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, policy)?).await?;
             let response = plain::query_stream(stream, &query).await?;
             codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
         }
@@ -134,8 +137,11 @@ pub async fn resolve_one_shaped(
 /// The `Doh`/`Dot` match arms have already established that, so `None` here would mean
 /// [`Kind::is_shapeable`] and this dispatch disagree — a bug, not a runtime condition. Surfacing it as
 /// an error rather than unwrapping keeps that impossible case from becoming a panic.
-fn tls_strategy(resolver: &Resolver, wire: &WirePlan) -> io::Result<flint_dial::BootstrapStrategy> {
-    resolver.tls_strategy_with(wire.clone()).ok_or_else(|| {
+fn tls_strategy(
+    resolver: &Resolver,
+    policy: &DialPolicy,
+) -> io::Result<flint_dial::BootstrapStrategy> {
+    resolver.tls_strategy_with(policy).ok_or_else(|| {
         io::Error::other(format!(
             "resolver {} has kind {:?}, which has no TLS dial strategy",
             resolver.name, resolver.kind
@@ -172,13 +178,31 @@ async fn system_lookup(name: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
 
 /// Resolve `name`/`qtype` resiliently: race every resolver in `pool` and return the first that yields
 /// a **validated** answer. Slower resolvers are cancelled once one succeeds. Errors only if all fail.
+///
+/// Uses a default [`DialPolicy`] — no shaping, platform default trust store. See [`resolve_with`] to
+/// pin trust anchors or apply shaping.
 pub async fn resolve(
     name: &str,
     qtype: u16,
     pool: &[Resolver],
 ) -> Result<Vec<IpAddr>, ResolveError> {
+    resolve_with(name, qtype, pool, &DialPolicy::default()).await
+}
+
+/// Like [`resolve`], but under an explicit [`DialPolicy`].
+pub async fn resolve_with(
+    name: &str,
+    qtype: u16,
+    pool: &[Resolver],
+    policy: &DialPolicy,
+) -> Result<Vec<IpAddr>, ResolveError> {
     match flint_dial::race_windowed(pool.len(), DEFAULT_WINDOW, |i| async move {
-        match tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(&pool[i], name, qtype)).await {
+        match tokio::time::timeout(
+            ATTEMPT_TIMEOUT,
+            resolve_one_with(&pool[i], name, qtype, policy),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -204,14 +228,29 @@ pub async fn resolve_cached(
     cache: &ResolverCache,
     network: &str,
 ) -> Result<Vec<IpAddr>, ResolveError> {
+    resolve_cached_with(name, qtype, pool, cache, network, &DialPolicy::default()).await
+}
+
+/// Like [`resolve_cached`], but under an explicit [`DialPolicy`].
+pub async fn resolve_cached_with(
+    name: &str,
+    qtype: u16,
+    pool: &[Resolver],
+    cache: &ResolverCache,
+    network: &str,
+    policy: &DialPolicy,
+) -> Result<Vec<IpAddr>, ResolveError> {
     // Fast path: the resolver that last worked on this network — bounded by the same per-attempt
     // timeout as the pool race, so a now-blackholed/filtered cached winner can't hang here
     // indefinitely. A timeout is treated exactly like a failure: forget the winner and fall through
     // to the full re-race (otherwise ATTEMPT_TIMEOUT would be defeated on the cached path).
     if let Some(winner) = cache.winner(network) {
         if let Some(resolver) = pool.iter().find(|r| r.name == winner) {
-            if let Ok(Ok(addrs)) =
-                tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(resolver, name, qtype)).await
+            if let Ok(Ok(addrs)) = tokio::time::timeout(
+                ATTEMPT_TIMEOUT,
+                resolve_one_with(resolver, name, qtype, policy),
+            )
+            .await
             {
                 return Ok(addrs);
             }
@@ -225,7 +264,12 @@ pub async fn resolve_cached(
     }
     // Slow path: race the whole pool and remember whoever wins.
     match flint_dial::race_windowed(pool.len(), DEFAULT_WINDOW, |i| async move {
-        match tokio::time::timeout(ATTEMPT_TIMEOUT, resolve_one(&pool[i], name, qtype)).await {
+        match tokio::time::timeout(
+            ATTEMPT_TIMEOUT,
+            resolve_one_with(&pool[i], name, qtype, policy),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,

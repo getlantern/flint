@@ -258,18 +258,31 @@ CSPRNG transaction ID that is checked on return, and UDP `connect`s its socket (
 filtering) on a random ephemeral port — the standard bar against **off-path** injection, which
 censors including the GFW perform by blasting forged answers without seeing the query.
 
-**Known gap: the resolver dial is not authenticated.** `BootstrapStrategy::boring_chrome` — which
-`Resolver::strategy` builds on — sets `CertVerification::None`, so neither the certificate chain nor
-the hostname is checked (`flint-tls`'s connector only enables `SslVerifyMode::PEER` and
-`set_verify_hostname` in the `Roots` branch). Encryption without authentication stops a passive
-reader and an off-path forger, but **not an active on-path MITM**, which can terminate the handshake
-with any certificate and return whatever answers it likes; bogon validation catches a clumsy sentinel,
-not a plausible attacker-chosen address. This undercuts the "raw-IP works because the cert carries IP
-SANs" rationale above, which is only meaningful when the cert is actually verified. `flint-fronted`
-already dials with `CertVerification::Roots`, so the fix is to do the same here — noting the identity
-to verify is the **real host** for plain/CDN-edge entries (where `sni == host`) and would need care for
-any fronted entry, whose cert matches the camouflage SNI rather than the DoH `:authority`. Tracked in
-§11.
+**The resolver dial is authenticated, and the identity is the SNI.** Every TLS resolver dial uses
+`CertVerification::Roots` — chain *and* hostname — never `None`. Encryption without authentication
+would have bought very little: an active on-path MITM could terminate the handshake with any
+certificate and return whatever answers it liked, and bogon validation catches a clumsy sentinel but
+not a plausible attacker-chosen address. (`boring_chrome` still defaults to `CertVerification::None`,
+so `Resolver::tls_strategy_with` applies `Roots` explicitly rather than inheriting the default — the
+earlier gap was precisely that inheritance.)
+
+The verified identity is the **SNI**, because the SNI is by definition the name whose certificate the
+server presents. For the ordinary raw-IP and CDN-edge entries `sni == host`, so this is just "verify
+the resolver hostname" — and it works despite dialing a bare IP because the identity checked is the
+hostname, not the address. That also makes the "raw-IP works because the cert carries IP SANs"
+rationale above unnecessary for our path: we never verify against the IP. For a **fronted** entry
+(`sni != host`) the front's certificate is what arrives, so that is what gets authenticated, with the
+real resolver addressed by `:authority` *inside* the verified channel — the trust model fronting always
+relies on.
+
+Trust anchors come from `DialPolicy::roots`: empty means the platform default store, which is
+`X509_STORE_set_default_paths()` and therefore OpenSSL's compile-time paths plus the
+`SSL_CERT_FILE`/`SSL_CERT_DIR` overrides. Desktop platforms have a working store; **mobile does not**,
+so an embedder must point those env vars at a bundled anchor set or pin roots explicitly. (The spark
+embedder — a separate repo, not this one — does exactly this in its `core/src/ca_roots.rs`, added for
+the same reason fronted TLS needed it.) The public
+`resolve`/`resolve_cached` signatures are unchanged — `*_with` variants take a policy — so existing
+consumers gain verification without a code change.
 
 ### 6.2 Proxyless: searching `resolver × wire` (`flint-proxyless`)
 
@@ -374,14 +387,19 @@ keeps every channel simple.
   strategy-update list relates to the broader bootstrap config and the server-side P5 loop.
 - **`record_fragment` interop** — confirm no widely-deployed resolver/middlebox rejects a
   record-fragmented CH (probe; the success-gated dialer tolerates it either way).
-- **Authenticate the resolver dial (§6.1 known gap).** `Resolver::strategy` inherits
-  `CertVerification::None` from `boring_chrome`, so DoH/DoT connections are encrypted but
-  **unauthenticated** — an on-path MITM can inject answers. Switch to `CertVerification::Roots`
-  (empty `roots_pem` = system roots, as `flint-fronted` already does). Open: which identity to verify
-  per addressing form — the real host for `sni == host` plain/CDN-edge entries is straightforward, but
-  a *fronted* entry presents a cert for the camouflage SNI, not the DoH `:authority`, so those need
-  either a distinct policy or exclusion. Also decide whether verification failure should down-rank a
-  resolver or hard-fail the attempt.
+- ~~**Authenticate the resolver dial.**~~ **Done** — every TLS resolver dial now verifies chain and
+  hostname (§6.1). The identity question resolved to "verify the SNI", which is uniform across
+  addressing forms: `sni == host` entries verify the resolver hostname, and a fronted entry
+  authenticates the front whose certificate actually arrives. Verification failure hard-fails that
+  resolver's attempt, which the pool race already treats as one candidate losing, so no separate
+  down-ranking was needed.
+- **Trust anchors on mobile.** Empty `DialPolicy::roots` falls back to OpenSSL's default paths, which
+  are empty on Android/iOS unless the embedder points `SSL_CERT_FILE`/`SSL_CERT_DIR` at a bundled set
+  (as the spark embedder does in its own repo — see §6.1). That coupling is implicit: flint cannot tell
+  whether an embedder
+  has done it, and gets an indistinguishable "unable to get local issuer certificate" either way. Open:
+  whether flint should expose a cheap self-check (verify one known-good anchor at startup) so a
+  misconfigured embedder fails loudly at init instead of looking like a blocked network.
 
 ## 12. References
 
