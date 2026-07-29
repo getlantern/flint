@@ -1,31 +1,50 @@
-//! Resilient DNS-over-HTTPS: un-poisoned answers in censored regions (design §6).
+//! Resilient DNS: un-poisoned answers in censored regions (design §6).
 //!
-//! The first [`flint_dial`] consumer. [`resolve`] races a diverse [`pool`] of DoH resolvers, each
-//! reached by a composable bootstrap dial (boring Chrome-mimicry TLS), runs a [`codec`]-built A/AAAA
-//! query over [`doh`] (HTTP/2), [`validate`]s the answer (drops poison/bogons), and returns the first
-//! resolver that yields a real answer. Because DoH is encrypted transport, a censor can't poison an
-//! answer — only block a connection — so "uncensored DNS" reduces to "reach *one* resolver", which is
-//! exactly what the raced bootstrap dials are for.
+//! The first [`flint_dial`] consumer. [`resolve`] races a diverse [`pool`] of resolvers, each reached
+//! by a composable bootstrap dial (boring Chrome-mimicry TLS), runs a [`codec`]-built A/AAAA query,
+//! [`validate`]s the answer (drops poison/bogons), and returns the first resolver that yields a real
+//! answer. Because an encrypted transport keeps a censor from *rewriting* an answer in flight — mostly
+//! leaving it the blunter option of blocking the connection — "uncensored DNS" largely reduces to
+//! "reach *one* resolver", which is exactly what the raced bootstrap dials are for.
+//!
+//! **Caveat, and it is a real one:** the default dial does not authenticate the resolver
+//! ([`CertVerification::None`](flint_dial::CertVerification::None) via
+//! [`BootstrapStrategy::boring_chrome`](flint_dial::BootstrapStrategy::boring_chrome)), so an
+//! **on-path** attacker can terminate TLS with any certificate and inject answers. [`validate`] would
+//! catch a clumsy sentinel but not a plausible attacker-chosen address. Callers wanting that closed
+//! must pass [`CertVerification::Roots`](flint_dial::CertVerification::Roots); see [`Kind`].
+//!
+//! **Two independent axes.** A resolver's [`Kind`] picks the DNS protocol and endpoint (DoH, DoT,
+//! plaintext TCP/UDP, or the system resolver); a [`WirePlan`] picks how the opening handshake looks on
+//! the wire (record fragmentation, segment splitting, inter-segment jitter). [`resolve_one_shaped`]
+//! composes them, so a DoH lookup can itself be carried over a fragmented, jittered ClientHello — the
+//! same shaping vocabulary used for a destination dial, aimed at the DNS dial. Encrypted kinds are the
+//! trustworthy ones; the plaintext kinds are poisonable and stay out of [`default_pool`] (see there).
 //!
 //! Build pieces: [`codec`] (minimal A/AAAA wire codec), [`validate`] (poison rejection), [`pool`]
-//! (the diverse resolver set), [`doh`] (DoH-over-h2), and [`resolve`] (the smart-dialer). Per-network
-//! caching of the winning composition and Ed25519-signed pool updates are follow-ups (design §6).
+//! (the diverse resolver set + the [`Kind`] axis), [`doh`] (DoH-over-h2), [`plain`] (DoT/TCP framing +
+//! UDP), and [`resolve`] (the smart-dialer). Per-network caching of the winning composition and
+//! Ed25519-signed pool updates are follow-ups (design §6).
 #![forbid(unsafe_code)]
 
 use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use ring::rand::{SecureRandom, SystemRandom};
+
 pub mod cache;
 pub mod codec;
 pub mod doh;
+pub mod plain;
 pub mod pool;
 pub mod signed;
 pub mod validate;
 
 pub use cache::ResolverCache;
 pub use codec::{TYPE_A, TYPE_AAAA};
-pub use pool::{default_pool, Resolver};
+pub use flint_dial::WirePlan;
+pub use pool::{default_pool, Kind, Resolver};
 pub use signed::{load_signed_pool, PoolUpdate};
 
 /// Why a resolution failed.
@@ -50,15 +69,105 @@ const DEFAULT_WINDOW: usize = 16;
 /// instead of hanging on the slowest resolver.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Resolve `name`/`qtype` through a single `resolver`: dial it (composable bootstrap dial), run the
-/// DoH query, parse, and validate. Returns the validated public addresses, or an `io::Error` (which
-/// the smart-dialer funnels into the race's per-resolver failures).
+/// Resolve `name`/`qtype` through a single `resolver`: reach it over whatever transport its
+/// [`Kind`] names, run the query, parse, and validate. Returns the validated public addresses, or an
+/// `io::Error` (which the smart-dialer funnels into the race's per-resolver failures).
+///
+/// Applies no opening-handshake shaping; see [`resolve_one_shaped`].
 pub async fn resolve_one(resolver: &Resolver, name: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-    let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
-    let stream = flint_dial::dial(&resolver.strategy()).await?;
-    let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
-    let answers = codec::parse_response(&response).map_err(io::Error::other)?;
+    resolve_one_shaped(resolver, name, qtype, &WirePlan::default()).await
+}
+
+/// Like [`resolve_one`], but composes opening-handshake shaping `wire` onto the dial that reaches the
+/// resolver.
+///
+/// This is the seam that makes the two axes independent: `resolver` picks *which DNS protocol and
+/// endpoint*, `wire` picks *how the opening handshake looks on the wire* (record fragmentation, segment
+/// splitting, inter-segment jitter). So a DoH lookup can itself be carried over a fragmented, jittered
+/// ClientHello — the same shaping vocabulary applied to a destination dial, pointed at the DNS dial.
+///
+/// `wire` is ignored for kinds that expose no ClientHello to shape ([`Kind::is_shapeable`]).
+///
+/// Transaction IDs: DoH uses ID 0 per RFC 8484 §4.1, since its own framing binds the response. Every
+/// other transport draws a random ID and verifies it on return — mandatory for the plaintext kinds,
+/// harmless for DoT.
+pub async fn resolve_one_shaped(
+    resolver: &Resolver,
+    name: &str,
+    qtype: u16,
+    wire: &WirePlan,
+) -> io::Result<Vec<IpAddr>> {
+    let answers = match resolver.kind {
+        Kind::Doh => {
+            let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
+            let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
+            codec::parse_response(&response).map_err(io::Error::other)?
+        }
+        Kind::Dot => {
+            let id = random_id()?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let stream = flint_dial::dial(&tls_strategy(resolver, wire)?).await?;
+            let response = plain::query_stream(stream, &query).await?;
+            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+        }
+        Kind::Tcp => {
+            let id = random_id()?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let stream = tokio::net::TcpStream::connect(resolver.target).await?;
+            let response = plain::query_stream(stream, &query).await?;
+            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+        }
+        Kind::Udp => {
+            let id = random_id()?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let response = plain::query_udp(resolver.target, &query).await?;
+            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+        }
+        Kind::System => system_lookup(name, qtype).await?,
+    };
     validate::validate_answers(answers).map_err(io::Error::other)
+}
+
+/// The TLS strategy for a resolver whose kind is known to be TLS-based.
+///
+/// The `Doh`/`Dot` match arms have already established that, so `None` here would mean
+/// [`Kind::is_shapeable`] and this dispatch disagree — a bug, not a runtime condition. Surfacing it as
+/// an error rather than unwrapping keeps that impossible case from becoming a panic.
+fn tls_strategy(resolver: &Resolver, wire: &WirePlan) -> io::Result<flint_dial::BootstrapStrategy> {
+    resolver.tls_strategy_with(wire.clone()).ok_or_else(|| {
+        io::Error::other(format!(
+            "resolver {} has kind {:?}, which has no TLS dial strategy",
+            resolver.name, resolver.kind
+        ))
+    })
+}
+
+/// A CSPRNG-drawn DNS transaction ID. Uses `ring` like the rest of flint rather than adding an RNG.
+fn random_id() -> io::Result<u16> {
+    let mut bytes = [0u8; 2];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("CSPRNG failure drawing a DNS transaction ID"))?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+/// Resolve through the OS resolver, keeping only the family `qtype` asked for.
+///
+/// Worth trying because plenty of networks do not interfere with DNS at all, and it costs no
+/// connection of our own. Trust it exactly as much as any plaintext answer: the OS resolver usually
+/// speaks unencrypted DNS to a network-provided server, so the result is poisonable.
+async fn system_lookup(name: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+    let addrs = tokio::net::lookup_host((name, 0u16)).await?;
+    Ok(addrs
+        .map(|addr| addr.ip())
+        .filter(|ip| match qtype {
+            TYPE_A => ip.is_ipv4(),
+            TYPE_AAAA => ip.is_ipv6(),
+            // Not a family query — the codec only builds A/AAAA, so this is unreachable in practice.
+            _ => true,
+        })
+        .collect())
 }
 
 /// Resolve `name`/`qtype` resiliently: race every resolver in `pool` and return the first that yields

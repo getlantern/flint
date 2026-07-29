@@ -232,6 +232,45 @@ the next composition.
 bytes; bootstrap only needs A/AAAA of a few hostnames) to protect the binary budget, vs pulling
 `hickory-proto` (pure-Rust, handles DoH/DoT/DoQ + full wire format, but sizable). Open question §11.
 
+### 6.1 The resolver-transport axis (built) — and why it is orthogonal to shaping
+
+The "AND transports" spread above is realized by `pool::Kind`: **DoH** (RFC 8484 over h2), **DoT**
+(RFC 7858), plaintext **TCP** and **UDP** (RFC 1035), and the **system** resolver. This is the *DNS
+axis* of a proxyless strategy: where and by what protocol an answer is obtained.
+
+It is deliberately **independent of the wire-shaping axis** (§5). A resolver contributes addressing;
+a `WirePlan` contributes opening-handshake shape (record fragmentation, segment splitting,
+inter-segment jitter). `Resolver::strategy_with(wire)` / `resolve_one_shaped` compose the two, so a
+DoH lookup can itself be carried over a fragmented, jittered ClientHello — the same shaping
+vocabulary used for a destination dial, aimed at the DNS dial. Keeping them orthogonal is what makes
+the strategy space a product (`resolver × wire`) that a search can enumerate, rather than a fixed
+list of hand-written combinations. Shaping applies to the TLS-based kinds only (`Kind::is_shapeable`);
+plaintext DNS has no ClientHello and the system resolver exposes no socket.
+
+**Trust is not uniform across the axis, and the code says so.** DoH/DoT encrypt the query, so it
+cannot be read or rewritten in flight; plaintext TCP/UDP and the system resolver are *poisonable by
+anyone on the path*. Answer validation
+above rejects **bogons**, but nothing here proves an answer is *correct* — a censor returning a
+plausible wrong address passes validation. So the plaintext kinds are excluded from `default_pool()`
+and are sound only inside a search that verifies the answer end-to-end by completing a TLS handshake
+with a valid certificate against the resolved address. Where they are used, the query carries a
+CSPRNG transaction ID that is checked on return, and UDP `connect`s its socket (kernel-level source
+filtering) on a random ephemeral port — the standard bar against **off-path** injection, which
+censors including the GFW perform by blasting forged answers without seeing the query.
+
+**Known gap: the resolver dial is not authenticated.** `BootstrapStrategy::boring_chrome` — which
+`Resolver::strategy` builds on — sets `CertVerification::None`, so neither the certificate chain nor
+the hostname is checked (`flint-tls`'s connector only enables `SslVerifyMode::PEER` and
+`set_verify_hostname` in the `Roots` branch). Encryption without authentication stops a passive
+reader and an off-path forger, but **not an active on-path MITM**, which can terminate the handshake
+with any certificate and return whatever answers it likes; bogon validation catches a clumsy sentinel,
+not a plausible attacker-chosen address. This undercuts the "raw-IP works because the cert carries IP
+SANs" rationale above, which is only meaningful when the cert is actually verified. `flint-fronted`
+already dials with `CertVerification::Roots`, so the fix is to do the same here — noting the identity
+to verify is the **real host** for plain/CDN-edge entries (where `sni == host`) and would need care for
+any fronted entry, whose cert matches the camouflage SNI rather than the DoH `:authority`. Tracked in
+§11.
+
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
 Browsers do DoH with *their own* ClientHello, so a generic (rustls) TLS stack doing DoH is **itself a
@@ -303,6 +342,14 @@ keeps every channel simple.
   strategy-update list relates to the broader bootstrap config and the server-side P5 loop.
 - **`record_fragment` interop** — confirm no widely-deployed resolver/middlebox rejects a
   record-fragmented CH (probe; the success-gated dialer tolerates it either way).
+- **Authenticate the resolver dial (§6.1 known gap).** `Resolver::strategy` inherits
+  `CertVerification::None` from `boring_chrome`, so DoH/DoT connections are encrypted but
+  **unauthenticated** — an on-path MITM can inject answers. Switch to `CertVerification::Roots`
+  (empty `roots_pem` = system roots, as `flint-fronted` already does). Open: which identity to verify
+  per addressing form — the real host for `sni == host` plain/CDN-edge entries is straightforward, but
+  a *fronted* entry presents a cert for the camouflage SNI, not the DoH `:authority`, so those need
+  either a distinct policy or exclusion. Also decide whether verification failure should down-rank a
+  resolver or hard-fail the attempt.
 
 ## 12. References
 

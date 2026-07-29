@@ -28,6 +28,10 @@ mod race;
 mod strategy;
 
 pub use engine::{dial, dial_alpn, dial_over, dial_over_alpn};
+// Re-exported because `BootstrapStrategy::wire` is part of this crate's public API: a consumer cannot
+// compose opening-handshake shaping (record fragmentation, segment splitting, inter-segment jitter)
+// without these types, and should not have to take a direct `flint-shaping` dependency to do it.
+pub use flint_shaping::{DelaySpec, RecordFragment, SegmentSplit, WirePlan};
 pub use flint_tls::CertVerification;
 pub use race::{probe_windowed, race, race_windowed, race_with};
 pub use strategy::{BootstrapStrategy, TlsEngine};
