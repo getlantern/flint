@@ -23,11 +23,25 @@ use flint_dial::{BootstrapStrategy, WirePlan};
 
 /// Which DNS protocol a resolver speaks — the **DNS axis** of a proxyless strategy.
 ///
-/// [`Doh`](Kind::Doh) and [`Dot`](Kind::Dot) are encrypted, so a censor can only *block* the
-/// connection, never poison the answer. [`Tcp`](Kind::Tcp) and [`Udp`](Kind::Udp) are **plaintext and
-/// therefore poisonable**; they earn a place in the strategy space only because some networks filter
+/// [`Doh`](Kind::Doh) and [`Dot`](Kind::Dot) encrypt the query, so an observer cannot read or rewrite
+/// it *in flight*. [`Tcp`](Kind::Tcp) and [`Udp`](Kind::Udp) are **plaintext and therefore poisonable
+/// by anyone on the path**; they earn a place in the strategy space only because some networks filter
 /// encrypted DNS while leaving plaintext queries to an unfiltered resolver alone. They are deliberately
 /// absent from [`default_pool`] — see that function for why.
+///
+/// <div class="warning">
+///
+/// **Encryption is not authentication, and the default strategy does not authenticate.**
+/// [`Resolver::strategy`] builds on [`BootstrapStrategy::boring_chrome`], whose
+/// `verification` is [`CertVerification::None`](flint_dial::CertVerification::None) — the peer
+/// certificate and hostname are *not* checked. So an **on-path** attacker can complete the handshake
+/// with any certificate it likes and hand back forged answers over a perfectly encrypted channel. The
+/// encrypted kinds therefore resist *off-path* forgery and passive reading, not an active on-path
+/// MITM, until a caller supplies [`CertVerification::Roots`](flint_dial::CertVerification::Roots) via
+/// [`BootstrapStrategy::with_verification`]. Tracked as a follow-up; `flint-fronted` already does this
+/// for its dials.
+///
+/// </div>
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// DNS-over-HTTPS (RFC 8484) over HTTP/2, port 443. Uses `sni`, `host`, and `path`.
@@ -46,9 +60,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// True if this transport encrypts the query, so the channel itself binds the response to it (and
-    /// a censor cannot forge an answer, only block). Plaintext kinds must instead rely on a random
+    /// True if this transport encrypts the query, so the channel binds the response to it and an
+    /// **off-path** attacker cannot forge an answer. Plaintext kinds must instead rely on a random
     /// transaction ID — see [`crate::codec::build_query_with_id`].
+    ///
+    /// This says nothing about an **on-path** attacker: with the default
+    /// [`CertVerification::None`](flint_dial::CertVerification::None) the peer is unauthenticated, so
+    /// encryption alone does not make the answer trustworthy. See the [`Kind`] docs.
     pub fn is_encrypted(self) -> bool {
         matches!(self, Kind::Doh | Kind::Dot)
     }
@@ -191,11 +209,16 @@ fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
 /// **no-threat-blocking** `9.9.9.10` so a flagged config host is never `NXDOMAIN`'d out from under us.
 ///
 /// **Encrypted kinds only, on purpose.** [`Kind::Udp`]/[`Kind::Tcp`]/[`Kind::System`] answers are
-/// poisonable, and nothing in [`crate::resolve`] proves an answer is *correct* — [`crate::validate`]
-/// only rejects bogons, so a censor returning a plausible wrong IP would pass. Plaintext resolvers are
-/// therefore safe to try only where the answer gets verified end-to-end by actually completing a TLS
-/// handshake with a valid certificate against the resolved address (the proxyless strategy search).
-/// Callers who want them must add them explicitly rather than getting them by default here.
+/// poisonable by anyone on the path, and nothing in [`crate::resolve`] proves an answer is *correct* —
+/// [`crate::validate`] only rejects bogons, so a censor returning a plausible wrong IP would pass.
+/// Plaintext resolvers are therefore safe to try only where the answer gets verified end-to-end by
+/// actually completing a TLS handshake with a valid certificate against the resolved address (the
+/// proxyless strategy search). Callers who want them must add them explicitly rather than getting them
+/// by default here.
+///
+/// Note this is a *relative* preference, not a clean bill of health: while the dial stays on
+/// [`CertVerification::None`](flint_dial::CertVerification::None) the entries below are unauthenticated
+/// too, so they resist off-path forgery rather than an on-path MITM. See [`Kind`].
 pub fn default_pool() -> Vec<Resolver> {
     vec![
         // CDN-edge spearhead: Cloudflare runs its DoH resolver on the *same* global anycast edge that

@@ -3,9 +3,16 @@
 //! The first [`flint_dial`] consumer. [`resolve`] races a diverse [`pool`] of resolvers, each reached
 //! by a composable bootstrap dial (boring Chrome-mimicry TLS), runs a [`codec`]-built A/AAAA query,
 //! [`validate`]s the answer (drops poison/bogons), and returns the first resolver that yields a real
-//! answer. Because an encrypted transport keeps a censor from poisoning an answer — only from blocking
-//! a connection — "uncensored DNS" reduces to "reach *one* resolver", which is exactly what the raced
-//! bootstrap dials are for.
+//! answer. Because an encrypted transport keeps a censor from *rewriting* an answer in flight — mostly
+//! leaving it the blunter option of blocking the connection — "uncensored DNS" largely reduces to
+//! "reach *one* resolver", which is exactly what the raced bootstrap dials are for.
+//!
+//! **Caveat, and it is a real one:** the default dial does not authenticate the resolver
+//! ([`CertVerification::None`](flint_dial::CertVerification::None) via
+//! [`BootstrapStrategy::boring_chrome`](flint_dial::BootstrapStrategy::boring_chrome)), so an
+//! **on-path** attacker can terminate TLS with any certificate and inject answers. [`validate`] would
+//! catch a clumsy sentinel but not a plausible attacker-chosen address. Callers wanting that closed
+//! must pass [`CertVerification::Roots`](flint_dial::CertVerification::Roots); see [`Kind`].
 //!
 //! **Two independent axes.** A resolver's [`Kind`] picks the DNS protocol and endpoint (DoH, DoT,
 //! plaintext TCP/UDP, or the system resolver); a [`WirePlan`] picks how the opening handshake looks on
