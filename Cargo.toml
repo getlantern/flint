@@ -6,6 +6,7 @@ members = [
     "crates/flint-tls",
     "crates/flint-dial",
     "crates/flint-dns",
+    "crates/flint-proxyless",
     "crates/flint-transport",
     "crates/flint-fronted",
     "crates/flint-kindling",

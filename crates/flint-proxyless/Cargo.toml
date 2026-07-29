@@ -1,0 +1,24 @@
+[package]
+name = "flint-proxyless"
+description = "Proxyless circumvention: search a resolver × wire-shaping space for a strategy that reaches the real destination unblocked."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The TLS engine used by both the probe and the destination dial. Without it `flint_dial::dial`
+# returns Unsupported, so the search logic still builds and unit-tests (the prober is injectable) but
+# a live search cannot connect.
+boring = ["flint-dial/boring", "flint-dns/boring"]
+
+[dependencies]
+flint-dial = { path = "../flint-dial" }
+flint-dns = { path = "../flint-dns" }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
