@@ -81,8 +81,11 @@ const PROBE_PORT: u16 = 443;
 /// into an ordinary losing candidate.
 ///
 /// Matches `flint-dns`'s per-resolver bound, and is chosen so a capped search fits inside a caller's own
-/// timeout: at [`PROBE_WINDOW`] 4, N candidates finish within `ceil(N / 4) × 5s`, so a cap of 8 lands
-/// under the 15s default of `flint_transport::RaceOptions`.
+/// timeout. At [`PROBE_WINDOW`] 4, N candidates finish within `ceil(N / 4) × 5s` — but a **stale cache
+/// entry adds one more 5s attempt in front of that**, since the cached winner is retried before the
+/// search begins. So the worst case a caller must budget for is `5s + ceil(N / 4) × 5s`, which puts a cap
+/// of 4 (10s) inside the 15s default of `flint_transport::RaceOptions` and a cap of 8 exactly at it —
+/// close enough to be cancelled at the boundary.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run `attempt` under [`ATTEMPT_TIMEOUT`], reporting a timeout as an ordinary failure so a stalled

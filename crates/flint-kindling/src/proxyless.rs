@@ -29,10 +29,17 @@ const DEFAULT_PORT: u16 = 443;
 ///
 /// The first connection on a new network is a **search**: up to `resolver × wire` candidates, each a DNS
 /// lookup plus a TLS handshake, four at a time. That can easily outlast
-/// [`RaceOptions::attempt_timeout`](flint_transport::RaceOptions::attempt_timeout), whose default is 15s
-/// — and because the timeout would kill the attempt *before* a winner is recorded, the cache would never
-/// populate and every subsequent attempt would fail the same way. A slow cold start would look like a
-/// permanently broken transport.
+/// [`RaceOptions::attempt_timeout`](flint_transport::RaceOptions::attempt_timeout), whose default is 15s —
+/// and because the timeout kills the attempt *before* a winner is recorded, the cache stays empty and the
+/// next attempt repeats the same search from scratch rather than benefiting from it. Whether it then
+/// succeeds is down to candidate timing, so this is not a permanent failure so much as an uninformed one:
+/// a transport that keeps re-running a search it never finishes looks broken.
+///
+/// Size the cap for the **stale-cache** case, not the cold one. A cached winner that has since been
+/// blocked costs one 5s attempt before the search even begins, so the worst case is
+/// `5s + ceil(candidates / 4) × 5s`. Against the 15s default that makes a cap of **4** the safe choice
+/// (10s total); a cap of 8 totals exactly 15s and can be cancelled at the boundary — precisely when it
+/// would otherwise have cached a new winner.
 ///
 /// Two mitigations, and it is worth using both:
 ///

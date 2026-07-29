@@ -327,8 +327,10 @@ with the certificate check unchanged. (`find`'s multi-domain form still exists f
 
 One interaction needs care: the first connection on a new network is a **search**, not a dial, and can
 outlast `RaceOptions::attempt_timeout` (default 15s). Being killed mid-search is worse than slow, because
-no winner is recorded — so the cache never populates and *every* later attempt fails identically, making
-a slow cold start look like a permanently broken transport. Hence two knobs. `with_max_candidates` is a
+no winner is recorded — so the cache stays empty and later attempts repeat the same cold search rather
+than benefiting from it. Whether they then succeed depends on candidate timing, so the failure is not
+strictly permanent; it is just uninformed, and a transport that keeps re-running a search it never gets to
+finish looks broken. Hence two knobs. `with_max_candidates` is a
 **strict** upper bound on candidates tried: resolvers are trimmed first, keeping every wire plan available
 while the budget allows — resolver diversity is the cheaper thing to lose, since the pool is deliberately
 redundant while each shaping plan is a distinct evasion strategy — and only a cap below the plan count
@@ -339,9 +341,15 @@ timeout for every transport.
 Each attempt is separately bounded (5s), which matters more than it looks: a censor's usual move is to
 **blackhole** rather than refuse, and `flint_dial::dial` does not bound its TCP connect, so an unbounded
 candidate would hold its window slot indefinitely and stop the race refilling — the search would then wait
-on its least responsive candidate. With a window of 4, N candidates therefore finish within
-`ceil(N / 4) × 5s`, so a cap of 8 lands inside the 15s `RaceOptions` default. That arithmetic is the whole
-reason the cap has to be strict.
+on its least responsive candidate.
+
+That gives the budget a caller can actually compute, and the **stale-cache path is the case to size for**:
+a cached winner that has since been blocked costs one 5s attempt *before* the search starts, so the worst
+case is `5s + ceil(N / 4) × 5s`, not `ceil(N / 4) × 5s`. Against the 15s `RaceOptions` default that makes a
+cap of **4** the safe recommendation (5s + 5s = 10s); a cap of 8 totals exactly 15s and can be cancelled
+right at the boundary — precisely when it would otherwise have cached a new winner. Callers who want a
+wider search should raise the outer timeout or `warm` out of band rather than rely on the margin. This
+arithmetic is the whole reason the cap has to be strict rather than advisory.
 
 ## 7. Why boring Chrome-CH is the default for DNS-over-TLS
 
