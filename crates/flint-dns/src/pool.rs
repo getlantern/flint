@@ -272,6 +272,12 @@ fn v4(name: &str, ip: [u8; 4], host: &str) -> Resolver {
     entry(name, ip, host, host)
 }
 
+/// An IPv6 raw-IP entry (SNI == DoH host), addressed as `[u16; 8]` groups so it stays infallible —
+/// same reason [`entry`] takes octets rather than parsing a string.
+fn v6(name: &str, ip: [u16; 8], host: &str) -> Resolver {
+    Resolver::doh(name, SocketAddr::from((ip, 443)), host, host, "/dns-query")
+}
+
 /// The default diverse pool (CDN-edge + raw-IP DoH). Spread across operators, hosting ASNs, and
 /// jurisdictions (US clouds, Swiss Quad9, Swedish Mullvad) — see the design's provider survey. The
 /// CDN-edge Cloudflare entries lead (the high-collateral spearhead). Quad9 uses the
@@ -364,6 +370,54 @@ pub fn default_pool() -> Vec<Resolver> {
         v4("google2", [8, 8, 4, 4], "dns.google"),
         v4("quad9", [9, 9, 9, 10], "dns.quad9.net"),
         v4("mullvad", [194, 242, 2, 2], "dns.mullvad.net"),
+        // IPv6 raw-IP forms. Without these the pool is unreachable on a **v6-only** network, which
+        // fails strategy selection outright rather than degrading — every candidate needs a resolver
+        // it can actually reach, so a v4-only pool means no proxyless strategy exists at all there.
+        //
+        // On a v4-only network these cost almost nothing: the connect fails immediately with
+        // "no route to host" rather than timing out, so the entry loses its race and frees its window
+        // slot straight away.
+        //
+        // Addresses confirmed against live AAAA records on 2026-07-30 (`dig AAAA <host>`). Note this
+        // is weaker than the "verified live" claim on the v4 entries above: those were confirmed to
+        // *answer DoH*, whereas these were confirmed only to be the right addresses — the vantage
+        // point used had no IPv6 egress. A v6-capable check should confirm they serve DoH with a valid
+        // certificate before they are relied on. Until then they can only help: a non-answering entry
+        // simply loses the race, exactly as a blocked one would.
+        v6(
+            "cloudflare-v6",
+            [0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0xf8f9],
+            "cloudflare-dns.com",
+        ),
+        v6(
+            "cloudflare-v6-2",
+            [0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0xf9f9],
+            "cloudflare-dns.com",
+        ),
+        v6(
+            "google-v6",
+            [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888],
+            "dns.google",
+        ),
+        v6(
+            "google-v6-2",
+            [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844],
+            "dns.google",
+        ),
+        // `2620:fe::10`, the v6 counterpart of the 9.9.9.10 **no-threat-blocking** service — matching
+        // the v4 entry above. `dns.quad9.net` itself resolves to `2620:fe::fe`, which is the
+        // *blocking* variant, so taking the hostname's AAAA record here would have quietly switched
+        // this entry's filtering behaviour relative to its v4 twin.
+        v6(
+            "quad9-v6",
+            [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0010],
+            "dns.quad9.net",
+        ),
+        v6(
+            "mullvad-v6",
+            [0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0002],
+            "dns.mullvad.net",
+        ),
     ]
 }
 
@@ -379,7 +433,6 @@ mod tests {
         assert!(pool.len() >= 5);
         for r in &pool {
             assert_eq!(r.target.port(), 443);
-            assert!(r.target.ip().is_ipv4());
             assert!(!r.sni.is_empty() && r.host == r.sni);
             assert_eq!(r.path, "/dns-query");
             // Every default entry is an encrypted kind, so each has a TLS strategy.
@@ -390,6 +443,44 @@ mod tests {
         // Operator diversity (not all one provider).
         let hosts: std::collections::HashSet<_> = pool.iter().map(|r| r.host.as_str()).collect();
         assert!(hosts.len() >= 4, "pool should span several operators");
+    }
+
+    #[test]
+    fn the_pool_is_dual_stack_and_every_operator_is_reachable_over_v6() {
+        // A v4-only pool is unreachable on a v6-only network, which fails strategy selection outright
+        // rather than degrading — so this is a reachability property, not a nicety.
+        let pool = default_pool();
+        let v6: Vec<_> = pool.iter().filter(|r| r.target.ip().is_ipv6()).collect();
+        let v4: Vec<_> = pool.iter().filter(|r| r.target.ip().is_ipv4()).collect();
+        assert!(!v4.is_empty(), "the pool must still work on v4-only");
+        assert!(!v6.is_empty(), "the pool must work on v6-only");
+
+        // Every operator reachable over v4 must also be reachable over v6, or a v6-only network
+        // silently loses the operator diversity the pool exists to provide — it would fall back to
+        // whichever one or two operators happened to get a v6 entry.
+        let v4_hosts: std::collections::HashSet<_> = v4.iter().map(|r| r.host.as_str()).collect();
+        let v6_hosts: std::collections::HashSet<_> = v6.iter().map(|r| r.host.as_str()).collect();
+        assert_eq!(
+            v4_hosts, v6_hosts,
+            "every operator needs both families, else v6-only loses operator diversity"
+        );
+    }
+
+    #[test]
+    fn the_v6_quad9_entry_is_the_no_blocking_service_like_its_v4_twin() {
+        // `dns.quad9.net` resolves to 2620:fe::fe, the *filtering* service. Taking the hostname's AAAA
+        // would have quietly given the v6 entry different filtering behaviour from the v4 one
+        // (9.9.9.10, no-block), so a flagged config host could be NXDOMAIN'd on v6 but not on v4.
+        let pool = default_pool();
+        let q6 = pool
+            .iter()
+            .find(|r| r.name == "quad9-v6")
+            .expect("a v6 Quad9 entry");
+        assert_eq!(
+            q6.target.ip(),
+            "2620:fe::10".parse::<std::net::IpAddr>().unwrap(),
+            "must be the no-blocking service, not 2620:fe::fe"
+        );
     }
 
     #[test]

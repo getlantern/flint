@@ -18,7 +18,8 @@ boring = ["flint-dial/boring", "flint-dns/boring"]
 flint-dial = { path = "../flint-dial" }
 flint-dns = { path = "../flint-dns" }
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+# `macros` for `tokio::join!` — the probe races A and AAAA so a v6-only network is not stranded.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

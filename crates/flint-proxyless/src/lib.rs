@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_dial::{BootstrapStrategy, CertVerification};
-use flint_dns::TYPE_A;
+use flint_dns::{TYPE_A, TYPE_AAAA};
 
 // Re-exported because they are unavoidable in this crate's own API: a caller cannot build a [`Space`]
 // without [`Resolver`] and [`WirePlan`], cannot read a [`Strategy`] without [`DialPolicy`], and cannot
@@ -449,9 +449,18 @@ pub async fn connect_cached(
 /// Requires the `boring` feature; without it [`flint_dial::dial`] reports the engine unsupported.
 pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
     bounded(async {
-        let addr = resolve_first(strategy, domain).await?;
-        let _stream = flint_dial::dial(&verified(addr, domain, &strategy.policy)).await?;
-        Ok(())
+        // Try each address: on a single-stack network the wrong family is unroutable, so stopping at
+        // the first would report "blocked" for a strategy that in fact works.
+        let mut last = None;
+        for addr in resolve_all(strategy, domain).await? {
+            match flint_dial::dial(&verified(addr, domain, &strategy.policy)).await {
+                Ok(_stream) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no address for {domain}"))
+        }))
     })
     .await
 }
@@ -462,24 +471,49 @@ pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
 /// certificate against `host`. Returns the established TLS stream for the caller to speak its own
 /// protocol over (an HTTP/2 config fetch, say).
 pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<BoxedTlsStream> {
-    let ip = resolve_first(strategy, host).await?.ip();
-    flint_dial::dial(&verified(SocketAddr::new(ip, port), host, &strategy.policy)).await
+    let mut last = None;
+    for addr in resolve_all(strategy, host).await? {
+        let target = SocketAddr::new(addr.ip(), port);
+        match flint_dial::dial(&verified(target, host, &strategy.policy)).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"))
+    }))
 }
 
-/// Resolve `host` through `strategy`'s resolver and return its first address at [`PROBE_PORT`].
-async fn resolve_first(strategy: &Strategy, host: &str) -> io::Result<SocketAddr> {
-    let addrs =
-        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy).await?;
-    let ip = addrs.first().copied().ok_or_else(|| {
-        io::Error::new(
+/// Resolve `host` through `strategy`'s resolver and return its addresses at [`PROBE_PORT`], A first.
+///
+/// Both families, because asking only for A strands a **v6-only** network: the probe would find no
+/// address, every candidate would fail, and selection would report "nothing works" on a network where
+/// proxyless is perfectly viable. Either query may legitimately fail — a host with no AAAA record is
+/// ordinary — so only the empty union is an error.
+///
+/// Returns every address rather than the first: resolution succeeding does not make an address
+/// *reachable*, and on a single-stack network the wrong family is simply unroutable. The caller tries
+/// them in order.
+async fn resolve_all(strategy: &Strategy, host: &str) -> io::Result<Vec<SocketAddr>> {
+    let (a, aaaa) = tokio::join!(
+        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy),
+        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_AAAA, &strategy.policy),
+    );
+    let mut ips = a.unwrap_or_default();
+    ips.extend(aaaa.unwrap_or_default());
+    if ips.is_empty() {
+        return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "resolver {} returned no address for {host}",
                 strategy.resolver.name
             ),
-        )
-    })?;
-    Ok(SocketAddr::new(ip, PROBE_PORT))
+        ));
+    }
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, PROBE_PORT))
+        .collect())
 }
 
 /// A dial strategy to `target` that **verifies** the peer against `hostname`, shaped by `policy.wire`
