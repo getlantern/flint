@@ -449,18 +449,8 @@ pub async fn connect_cached(
 /// Requires the `boring` feature; without it [`flint_dial::dial`] reports the engine unsupported.
 pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
     bounded(async {
-        // Try each address: on a single-stack network the wrong family is unroutable, so stopping at
-        // the first would report "blocked" for a strategy that in fact works.
-        let mut last = None;
-        for addr in resolve_all(strategy, domain).await? {
-            match flint_dial::dial(&verified(addr, domain, &strategy.policy)).await {
-                Ok(_stream) => return Ok(()),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no address for {domain}"))
-        }))
+        let addrs = resolve_all(strategy, domain).await?;
+        dial_first(&addrs, domain, &strategy.policy).await.map(drop)
     })
     .await
 }
@@ -471,12 +461,43 @@ pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
 /// certificate against `host`. Returns the established TLS stream for the caller to speak its own
 /// protocol over (an HTTP/2 config fetch, say).
 pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<BoxedTlsStream> {
+    let addrs: Vec<SocketAddr> = resolve_all(strategy, host)
+        .await?
+        .into_iter()
+        .map(|a| SocketAddr::new(a.ip(), port))
+        .collect();
+    dial_first(&addrs, host, &strategy.policy).await
+}
+
+/// Dial each address in turn and return the first success, **slicing the attempt budget between
+/// them**.
+///
+/// Trying several addresses only helps if one of them can actually get a turn. A censor's usual move
+/// is to blackhole rather than refuse, so an unbudgeted first address can hang for the whole
+/// [`ATTEMPT_TIMEOUT`] and the fallback never runs — which would silently reintroduce the very
+/// false-negative that trying multiple addresses exists to prevent.
+///
+/// The slice is `ATTEMPT_TIMEOUT / addresses` rather than a full `ATTEMPT_TIMEOUT` each, so the
+/// per-candidate worst case stays at one `ATTEMPT_TIMEOUT`. That keeps the budget arithmetic the
+/// callers rely on intact (`5s + ceil(N / 4) × 5s`); giving each address the full timeout would
+/// quietly multiply a candidate's cost by its address count and blow the documented cap.
+async fn dial_first(
+    addrs: &[SocketAddr],
+    host: &str,
+    policy: &DialPolicy,
+) -> io::Result<BoxedTlsStream> {
+    let slice = ATTEMPT_TIMEOUT / u32::try_from(addrs.len().max(1)).unwrap_or(1);
     let mut last = None;
-    for addr in resolve_all(strategy, host).await? {
-        let target = SocketAddr::new(addr.ip(), port);
-        match flint_dial::dial(&verified(target, host, &strategy.policy)).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last = Some(e),
+    for &addr in addrs {
+        match tokio::time::timeout(slice, flint_dial::dial(&verified(addr, host, policy))).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => {
+                last = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{addr} did not answer within its share of the attempt budget"),
+                ))
+            }
         }
     }
     Err(last.unwrap_or_else(|| {
@@ -499,16 +520,35 @@ async fn resolve_all(strategy: &Strategy, host: &str) -> io::Result<Vec<SocketAd
         flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy),
         flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_AAAA, &strategy.policy),
     );
-    let mut ips = a.unwrap_or_default();
-    ips.extend(aaaa.unwrap_or_default());
+    // Keep the failures rather than `unwrap_or_default`-ing them away: if *both* queries fail, the
+    // cause matters. "Resolver unreachable" and "this domain genuinely has no records" are very
+    // different diagnoses, and collapsing both into a synthetic NotFound hides which one happened —
+    // exactly the information needed to tell a broken strategy from a nonexistent host.
+    let mut ips = Vec::new();
+    let mut err = None;
+    for result in [a, aaaa] {
+        match result {
+            Ok(found) => ips.extend(found),
+            Err(e) => err = Some(e),
+        }
+    }
     if ips.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "resolver {} returned no address for {host}",
-                strategy.resolver.name
+        return Err(match err {
+            Some(e) => io::Error::new(
+                e.kind(),
+                format!(
+                    "resolver {} could not resolve {host}: {e}",
+                    strategy.resolver.name
+                ),
             ),
-        ));
+            None => io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "resolver {} returned no address for {host}",
+                    strategy.resolver.name
+                ),
+            ),
+        });
     }
     Ok(ips
         .into_iter()
