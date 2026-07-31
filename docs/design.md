@@ -169,6 +169,18 @@ pool's value is the *spread*. The **spearhead is DoH reached over a high-collate
 **raw-IP** (no bootstrap-DNS chicken-and-egg; works wherever the cert carries IP SANs),
 **CDN-edge-front** (reach the resolver through a collateral-expensive range), and **hostname**.
 
+**Dual-stack, and for a hard reason.** Every operator below appears twice, once per address family.
+A v4-only pool is not merely suboptimal on a **v6-only** network — it is unreachable, so *no* resolver
+answers, every proxyless candidate fails, and strategy selection reports "nothing works" on a network
+where proxyless would in fact be viable. Adding v6 entries costs a v4-only client almost nothing: the
+connect fails immediately with "no route to host" rather than timing out, freeing its race slot at
+once. Both families per operator, not just one or two, or v6-only clients quietly lose the operator
+diversity the spread exists to provide. The probe resolves A **and** AAAA for the same reason.
+
+Note the Quad9 v6 entry is `2620:fe::10`, the no-blocking service matching the v4 `9.9.9.10` — the
+hostname's own AAAA (`2620:fe::fe`) is the *filtering* one, which would have given the two families
+different behaviour for a flagged host.
+
 **Provider survey (diverse pool — v1 candidates).** Beyond the usual Cloudflare/Google/OpenDNS, the
 pool deliberately spreads across operators, hosting ASNs, and *legal jurisdictions* — a censor that
 pressures or IP-blocks one operator shouldn't reach the others:

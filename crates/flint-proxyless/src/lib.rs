@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_dial::{BootstrapStrategy, CertVerification};
-use flint_dns::TYPE_A;
+use flint_dns::{TYPE_A, TYPE_AAAA};
 
 // Re-exported because they are unavoidable in this crate's own API: a caller cannot build a [`Space`]
 // without [`Resolver`] and [`WirePlan`], cannot read a [`Strategy`] without [`DialPolicy`], and cannot
@@ -87,6 +87,25 @@ const PROBE_PORT: u16 = 443;
 /// of 4 (10s) inside the 15s default of `flint_transport::RaceOptions` and a cap of 8 exactly at it —
 /// close enough to be cancelled at the boundary.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `attempt` until `deadline`, reporting expiry as an ordinary failure.
+///
+/// The deadline form exists so the phases of one attempt — resolving, then dialing — share a single
+/// budget instead of each claiming a fresh [`ATTEMPT_TIMEOUT`]. Two independent timeouts would double
+/// a candidate's worst case and break the callers' arithmetic; no timeout on resolution would let a
+/// hung resolver stall the whole path.
+async fn before<F, T>(deadline: tokio::time::Instant, attempt: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match tokio::time::timeout_at(deadline, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "proxyless attempt timed out",
+        )),
+    }
+}
 
 /// Run `attempt` under [`ATTEMPT_TIMEOUT`], reporting a timeout as an ordinary failure so a stalled
 /// candidate loses its race rather than blocking it.
@@ -448,12 +467,11 @@ pub async fn connect_cached(
 ///
 /// Requires the `boring` feature; without it [`flint_dial::dial`] reports the engine unsupported.
 pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
-    bounded(async {
-        let addr = resolve_first(strategy, domain).await?;
-        let _stream = flint_dial::dial(&verified(addr, domain, &strategy.policy)).await?;
-        Ok(())
-    })
-    .await
+    let deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
+    let addrs = before(deadline, resolve_all(strategy, domain)).await?;
+    dial_first(&addrs, domain, &strategy.policy, deadline)
+        .await
+        .map(drop)
 }
 
 /// Dial `host`:`port` through `strategy` — the payoff once [`find`] has chosen one.
@@ -462,24 +480,104 @@ pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
 /// certificate against `host`. Returns the established TLS stream for the caller to speak its own
 /// protocol over (an HTTP/2 config fetch, say).
 pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<BoxedTlsStream> {
-    let ip = resolve_first(strategy, host).await?.ip();
-    flint_dial::dial(&verified(SocketAddr::new(ip, port), host, &strategy.policy)).await
+    let deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
+    let addrs: Vec<SocketAddr> = before(deadline, resolve_all(strategy, host))
+        .await?
+        .into_iter()
+        .map(|a| SocketAddr::new(a.ip(), port))
+        .collect();
+    dial_first(&addrs, host, &strategy.policy, deadline).await
 }
 
-/// Resolve `host` through `strategy`'s resolver and return its first address at [`PROBE_PORT`].
-async fn resolve_first(strategy: &Strategy, host: &str) -> io::Result<SocketAddr> {
-    let addrs =
-        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy).await?;
-    let ip = addrs.first().copied().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "resolver {} returned no address for {host}",
-                strategy.resolver.name
+/// Dial each address in turn until `deadline`, returning the first success and **splitting the time
+/// that is actually left** between them.
+///
+/// Trying several addresses only helps if each can get a turn. A censor's usual move is to blackhole
+/// rather than refuse, so an unbudgeted first address can hang out the whole attempt and the fallback
+/// never runs — silently reintroducing the false negative that trying multiple addresses exists to
+/// prevent.
+///
+/// The share is computed from the time remaining to `deadline`, not from [`ATTEMPT_TIMEOUT`]: the
+/// caller has already spent part of that budget resolving, so slicing the full timeout would hand out
+/// shares that do not exist and let the outer deadline cut the last addresses off unheard. Taking a
+/// deadline rather than a duration is what keeps resolution and dialing honest about sharing one
+/// attempt — the whole candidate still costs at most one `ATTEMPT_TIMEOUT`, which is what the callers'
+/// budget arithmetic assumes.
+async fn dial_first(
+    addrs: &[SocketAddr],
+    host: &str,
+    policy: &DialPolicy,
+    deadline: tokio::time::Instant,
+) -> io::Result<BoxedTlsStream> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let slice = remaining / u32::try_from(addrs.len().max(1)).unwrap_or(1);
+    let mut last = None;
+    for &addr in addrs {
+        match tokio::time::timeout(slice, flint_dial::dial(&verified(addr, host, policy))).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => {
+                last = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{addr} did not answer within its share of the attempt budget"),
+                ))
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"))
+    }))
+}
+
+/// Resolve `host` through `strategy`'s resolver and return its addresses at [`PROBE_PORT`], A first.
+///
+/// Both families, because asking only for A strands a **v6-only** network: the probe would find no
+/// address, every candidate would fail, and selection would report "nothing works" on a network where
+/// proxyless is perfectly viable. Either query may legitimately fail — a host with no AAAA record is
+/// ordinary — so only the empty union is an error.
+///
+/// Returns every address rather than the first: resolution succeeding does not make an address
+/// *reachable*, and on a single-stack network the wrong family is simply unroutable. The caller tries
+/// them in order.
+async fn resolve_all(strategy: &Strategy, host: &str) -> io::Result<Vec<SocketAddr>> {
+    let (a, aaaa) = tokio::join!(
+        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_A, &strategy.policy),
+        flint_dns::resolve_one_with(&strategy.resolver, host, TYPE_AAAA, &strategy.policy),
+    );
+    // Keep the failures rather than `unwrap_or_default`-ing them away: if *both* queries fail, the
+    // cause matters. "Resolver unreachable" and "this domain genuinely has no records" are very
+    // different diagnoses, and collapsing both into a synthetic NotFound hides which one happened —
+    // exactly the information needed to tell a broken strategy from a nonexistent host.
+    let mut ips = Vec::new();
+    let mut err = None;
+    for result in [a, aaaa] {
+        match result {
+            Ok(found) => ips.extend(found),
+            Err(e) => err = Some(e),
+        }
+    }
+    if ips.is_empty() {
+        return Err(match err {
+            Some(e) => io::Error::new(
+                e.kind(),
+                format!(
+                    "resolver {} could not resolve {host}: {e}",
+                    strategy.resolver.name
+                ),
             ),
-        )
-    })?;
-    Ok(SocketAddr::new(ip, PROBE_PORT))
+            None => io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "resolver {} returned no address for {host}",
+                    strategy.resolver.name
+                ),
+            ),
+        });
+    }
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, PROBE_PORT))
+        .collect())
 }
 
 /// A dial strategy to `target` that **verifies** the peer against `hostname`, shaped by `policy.wire`
