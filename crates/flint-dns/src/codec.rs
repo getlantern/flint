@@ -101,9 +101,10 @@ pub fn parse_response_with_id(buf: &[u8], expected_id: u16) -> Result<Vec<IpAddr
     parse_response(buf)
 }
 
-/// Parse a DNS response, returning the A/AAAA addresses in its answer section. Errors on a truncated
-/// message, a query (not a response), or a non-zero RCODE. An empty answer list is *not* an error here
-/// (the validation layer decides what an empty/poisoned answer means).
+/// Parse a DNS response, returning the A/AAAA addresses in its answer section. Errors on a query
+/// (not a response), a non-zero RCODE, or a truncated answer — either a message that ended before a
+/// field it declared, or one whose **TC flag** says the server cut it short. An empty answer list is
+/// *not* an error here (the validation layer decides what an empty/poisoned answer means).
 ///
 /// Does **not** check the transaction ID — safe for DoH/DoT (the channel binds the response) but not
 /// for plaintext; see [`parse_response_with_id`].
@@ -118,6 +119,17 @@ pub fn parse_response(buf: &[u8]) -> Result<Vec<IpAddr>, DnsError> {
     let rcode = (flags & 0x000f) as u8;
     if rcode != 0 {
         return Err(DnsError::Rcode(rcode));
+    }
+    // TC: the answer did not fit and the server cut it short (RFC 1035 §4.1.1). Checked *after* the
+    // RCODE so a truncated NXDOMAIN still reports the more specific NXDOMAIN.
+    //
+    // Rejecting rather than parsing what arrived: a partial answer looks like a complete one, and if
+    // truncation happened to remove every address record we would report "this name has no address"
+    // — which callers now act on (see `flint_dns::indicts_resolver`) and would be exactly backwards,
+    // since the resolver is the thing that failed to serve us. We do no TCP-retry, so a resolver that
+    // truncates cannot answer this query and should lose to one that can.
+    if flags & 0x0200 != 0 {
+        return Err(DnsError::Truncated);
     }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
@@ -261,6 +273,35 @@ mod tests {
         );
         let ips = parse_response(&resp).unwrap();
         assert_eq!(ips, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn a_truncated_answer_is_rejected_rather_than_parsed_partially() {
+        // A TC response is syntactically fine and carries *some* records, so without this check it
+        // would parse as a success and silently return a partial answer.
+        let mut resp = build_response(
+            "example.com",
+            TYPE_A,
+            0,
+            &[(TYPE_A, vec![93, 184, 216, 34])],
+        );
+        resp[2] |= 0x02; // set TC in the high flags byte
+        assert_eq!(parse_response(&resp), Err(DnsError::Truncated));
+
+        // Clearing it again parses normally — proving TC is what rejected it, not the fixture.
+        resp[2] &= !0x02;
+        assert_eq!(
+            parse_response(&resp).unwrap(),
+            vec!["93.184.216.34".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_truncated_nxdomain_still_reports_nxdomain() {
+        // The RCODE is the more specific fact, so it wins over truncation.
+        let mut resp = build_response("nope.example", TYPE_A, 3, &[]);
+        resp[2] |= 0x02;
+        assert_eq!(parse_response(&resp), Err(DnsError::Rcode(3)));
     }
 
     #[test]
