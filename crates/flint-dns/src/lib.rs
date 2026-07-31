@@ -70,6 +70,56 @@ const DEFAULT_WINDOW: usize = 16;
 /// instead of hanging on the slowest resolver.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether a resolve error indicts the **resolver** rather than the name.
+///
+/// `false` means the resolver did its job and the name simply does not resolve — NXDOMAIN, or an
+/// answer carrying no usable address. A caller must not read that as reason to distrust the resolver:
+/// users mistype hosts and visit dead domains constantly, and discarding a working resolver every time
+/// one does would throw away a good strategy for an entirely normal event.
+///
+/// `true` means the resolver could not be reached, timed out, or answered in a way that cannot be
+/// believed (SERVFAIL, a malformed or mismatched response, bogon-only records). Those *are* grounds to
+/// stop using it and pick another.
+///
+/// This distinction is the whole reason the resolve paths map failures onto meaningful
+/// [`io::ErrorKind`]s instead of flattening everything to `Other` — without it a caller sees one
+/// undifferentiated error and cannot tell a broken network from a typo.
+///
+/// **[`Kind::System`] is the exception.** `getaddrinfo` reports "no such host" and "the network is
+/// down" through the same opaque failure, so a system-resolver error is reported as indicting. That
+/// errs toward re-selecting, which is the safe direction: moving off the OS resolver is cheap, and it
+/// is the right move whenever the network really has changed.
+pub fn indicts_resolver(err: &io::Error) -> bool {
+    err.kind() != io::ErrorKind::NotFound
+}
+
+/// Map a wire/codec failure onto an [`io::Error`] whose kind carries the distinction
+/// [`indicts_resolver`] depends on.
+fn codec_err(e: codec::DnsError) -> io::Error {
+    let kind = match e {
+        // The resolver answered authoritatively: this name has no address. Not its fault.
+        codec::DnsError::Rcode(3) => io::ErrorKind::NotFound,
+        // A name we could not even encode is our bug, not the resolver's.
+        codec::DnsError::BadName => io::ErrorKind::InvalidInput,
+        // Everything else — SERVFAIL/REFUSED, truncated, not-a-response, a mismatched transaction ID —
+        // is the resolver failing to give a usable answer.
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, e)
+}
+
+/// Map an answer-validation failure the same way.
+fn validate_err(e: validate::ValidateError) -> io::Error {
+    let kind = match e {
+        // Answered, but with nothing usable — the name, not the resolver.
+        validate::ValidateError::Empty => io::ErrorKind::NotFound,
+        // Bogons only. The resolver answered and the answer is a lie, which is very much about the
+        // resolver (or whoever is speaking for it).
+        validate::ValidateError::Poisoned => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, e)
+}
+
 /// Resolve `name`/`qtype` through a single `resolver`: reach it over whatever transport its
 /// [`Kind`] names, run the query, parse, and validate. Returns the validated public addresses, or an
 /// `io::Error` (which the smart-dialer funnels into the race's per-resolver failures).
@@ -102,34 +152,34 @@ pub async fn resolve_one_with(
 ) -> io::Result<Vec<IpAddr>> {
     let answers = match resolver.kind {
         Kind::Doh => {
-            let query = codec::build_query(name, qtype).map_err(io::Error::other)?;
+            let query = codec::build_query(name, qtype).map_err(codec_err)?;
             let stream = flint_dial::dial(&tls_strategy(resolver, policy)?).await?;
             let response = doh::query(stream, &resolver.host, &resolver.path, &query).await?;
-            codec::parse_response(&response).map_err(io::Error::other)?
+            codec::parse_response(&response).map_err(codec_err)?
         }
         Kind::Dot => {
             let id = random_id()?;
-            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(codec_err)?;
             let stream = flint_dial::dial(&tls_strategy(resolver, policy)?).await?;
             let response = plain::query_stream(stream, &query).await?;
-            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+            codec::parse_response_with_id(&response, id).map_err(codec_err)?
         }
         Kind::Tcp => {
             let id = random_id()?;
-            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(codec_err)?;
             let stream = tokio::net::TcpStream::connect(resolver.target).await?;
             let response = plain::query_stream(stream, &query).await?;
-            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+            codec::parse_response_with_id(&response, id).map_err(codec_err)?
         }
         Kind::Udp => {
             let id = random_id()?;
-            let query = codec::build_query_with_id(name, qtype, id).map_err(io::Error::other)?;
+            let query = codec::build_query_with_id(name, qtype, id).map_err(codec_err)?;
             let response = plain::query_udp(resolver.target, &query).await?;
-            codec::parse_response_with_id(&response, id).map_err(io::Error::other)?
+            codec::parse_response_with_id(&response, id).map_err(codec_err)?
         }
         Kind::System => system_lookup(name, qtype).await?,
     };
-    validate::validate_answers(answers).map_err(io::Error::other)
+    validate::validate_answers(answers).map_err(validate_err)
 }
 
 /// The TLS strategy for a resolver whose kind is known to be TLS-based.
@@ -290,6 +340,47 @@ pub async fn resolve_cached_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_that_does_not_resolve_does_not_indict_the_resolver() {
+        // The distinction that matters: a user mistyping a host must not cost a working resolver.
+        for e in [
+            codec_err(codec::DnsError::Rcode(3)),         // NXDOMAIN
+            validate_err(validate::ValidateError::Empty), // answered, no usable records
+        ] {
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+            assert!(!indicts_resolver(&e), "{e} must not blame the resolver");
+        }
+    }
+
+    #[test]
+    fn a_resolver_that_misbehaves_is_indicted() {
+        for e in [
+            codec_err(codec::DnsError::Rcode(2)), // SERVFAIL
+            codec_err(codec::DnsError::Truncated),
+            codec_err(codec::DnsError::NotAResponse),
+            codec_err(codec::DnsError::IdMismatch { got: 1, want: 2 }),
+            // Bogons only: the resolver answered, and the answer is a lie.
+            validate_err(validate::ValidateError::Poisoned),
+        ] {
+            assert!(indicts_resolver(&e), "{e} should blame the resolver");
+        }
+
+        // Transport failures are the clearest case of all — they never reach the codec.
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::ConnectionRefused] {
+            assert!(indicts_resolver(&io::Error::new(kind, "unreachable")));
+        }
+    }
+
+    #[test]
+    fn an_unencodable_name_is_our_bug_not_a_resolver_failure() {
+        // Still "indicts" (it is not a NotFound), but the kind records who to blame: nothing was ever
+        // sent, so no resolver was involved.
+        assert_eq!(
+            codec_err(codec::DnsError::BadName).kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[tokio::test]
     async fn resolve_on_an_empty_pool_fails() {
