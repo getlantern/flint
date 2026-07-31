@@ -90,7 +90,14 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// errs toward re-selecting, which is the safe direction: moving off the OS resolver is cheap, and it
 /// is the right move whenever the network really has changed.
 pub fn indicts_resolver(err: &io::Error) -> bool {
-    err.kind() != io::ErrorKind::NotFound
+    !matches!(
+        err.kind(),
+        // The resolver answered and the name has no address.
+        io::ErrorKind::NotFound
+        // We could not even encode the query, so nothing was sent and no resolver was involved.
+        // Blaming one for our own bad input would churn selection over a caller error.
+            | io::ErrorKind::InvalidInput
+    )
 }
 
 /// Map a wire/codec failure onto an [`io::Error`] whose kind carries the distinction
@@ -373,13 +380,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unencodable_name_is_our_bug_not_a_resolver_failure() {
-        // Still "indicts" (it is not a NotFound), but the kind records who to blame: nothing was ever
-        // sent, so no resolver was involved.
-        assert_eq!(
-            codec_err(codec::DnsError::BadName).kind(),
-            io::ErrorKind::InvalidInput
-        );
+    fn an_unencodable_name_is_our_bug_and_indicts_nobody() {
+        // Nothing was ever sent, so no resolver was involved. Blaming one would discard a working
+        // strategy over a caller error — the same class of mistake as blaming it for a typo'd domain,
+        // which is the whole point of this predicate.
+        let e = codec_err(codec::DnsError::BadName);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(!indicts_resolver(&e), "a caller-input error blames nobody");
     }
 
     #[tokio::test]
