@@ -35,23 +35,39 @@
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
-/// Where BoringSSL will look for default trust anchors, and whether anything is there.
+/// One place BoringSSL looks for anchors, and what is actually there.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrustAnchorSources {
-    /// The bundle file BoringSSL will read, and whether it exists and is non-empty.
-    pub file: (PathBuf, bool),
-    /// The hashed-anchor directory BoringSSL will read, and whether it exists and is non-empty.
-    pub dir: (PathBuf, bool),
-    /// True if `SSL_CERT_FILE` or `SSL_CERT_DIR` supplied either path (rather than the compiled-in
-    /// default). Distinguishes "the embedder configured this and it is wrong" from "nobody configured
-    /// anything" — a much more useful thing to say in an error.
+pub struct AnchorSource {
+    /// The path BoringSSL will read.
+    pub path: PathBuf,
+    /// Whether that path yields anything to load.
+    pub usable: bool,
+    /// Whether `path` came from the environment override rather than the compiled-in default.
+    /// Distinguishes "the embedder configured this and it is wrong" from "nobody configured anything"
+    /// — a much more useful thing to say in an error, and per-source so the message can name the
+    /// variable actually at fault.
     pub from_env: bool,
 }
 
+/// Where BoringSSL will look for default trust anchors, and whether anything is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustAnchorSources {
+    /// The bundle file BoringSSL will read.
+    pub file: AnchorSource,
+    /// The hashed-anchor directory BoringSSL will read.
+    pub dir: AnchorSource,
+}
+
 impl TrustAnchorSources {
-    /// True if either source would give BoringSSL something to load.
+    /// True if either source would give BoringSSL something to load. BoringSSL registers both lookups,
+    /// so one live source is enough.
     pub fn any_usable(&self) -> bool {
-        self.file.1 || self.dir.1
+        self.file.usable || self.dir.usable
+    }
+
+    /// True if either path came from an environment override.
+    pub fn from_env(&self) -> bool {
+        self.file.from_env || self.dir.from_env
     }
 }
 
@@ -59,8 +75,8 @@ impl TrustAnchorSources {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(
     "no usable TLS trust anchors: {}, {}. {}",
-    describe(&sources.file, "bundle"),
-    describe(&sources.dir, "directory"),
+    describe(&sources.file, "bundle", "SSL_CERT_FILE"),
+    describe(&sources.dir, "directory", "SSL_CERT_DIR"),
     advice(sources)
 )]
 pub struct NoTrustAnchors {
@@ -68,21 +84,23 @@ pub struct NoTrustAnchors {
     pub sources: TrustAnchorSources,
 }
 
-fn describe(entry: &(PathBuf, bool), what: &str) -> String {
-    let (path, ok) = entry;
-    if *ok {
-        format!("{what} {} is usable", path.display())
-    } else if path.as_os_str().is_empty() {
-        // Worth calling out rather than printing a blank path: an empty value is not a no-op, it
-        // *suppresses* the compiled-in default, so this source loads nothing.
-        format!("{what} path is set to an empty value, which suppresses the built-in default")
+fn describe(source: &AnchorSource, what: &str, var: &str) -> String {
+    if source.usable {
+        format!("{what} {} is usable", source.path.display())
+    } else if source.from_env && source.path.as_os_str().is_empty() {
+        // Worth naming rather than printing a blank path: an empty override is not a no-op, it
+        // *suppresses* the compiled-in default, so this source loads nothing. Gated on `from_env`
+        // because only an override can be empty — the compiled-in defaults are literal
+        // concatenations (`OPENSSLDIR "/certs"`) — and a blank path from anywhere else would make
+        // the "suppresses" claim false.
+        format!("{var} is set to an empty value, which suppresses the built-in {what}")
     } else {
-        format!("{what} {} is missing or empty", path.display())
+        format!("{what} {} is missing or empty", source.path.display())
     }
 }
 
 fn advice(sources: &TrustAnchorSources) -> &'static str {
-    if sources.from_env {
+    if sources.from_env() {
         "SSL_CERT_FILE/SSL_CERT_DIR is set but points at nothing usable — check the path the embedder installed"
     } else {
         "set SSL_CERT_FILE to a bundled CA bundle (Android and iOS keep their roots where these default paths cannot see them)"
@@ -118,9 +136,16 @@ pub fn default_trust_anchor_sources() -> TrustAnchorSources {
         boringssl_default_cert_dir(),
     );
     TrustAnchorSources {
-        file: (file.clone(), is_non_empty_file(&file)),
-        dir: (dir.clone(), is_non_empty_dir(&dir)),
-        from_env: file_from_env || dir_from_env,
+        file: AnchorSource {
+            usable: is_non_empty_file(&file),
+            path: file,
+            from_env: file_from_env,
+        },
+        dir: AnchorSource {
+            usable: holds_an_entry(&dir),
+            path: dir,
+            from_env: dir_from_env,
+        },
     }
 }
 
@@ -150,8 +175,19 @@ fn is_non_empty_file(path: &Path) -> bool {
 }
 
 /// Likewise a hashed-anchor directory that exists but holds nothing.
-fn is_non_empty_dir(path: &Path) -> bool {
-    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+///
+/// Deliberately weaker than the file check, and worth being explicit about: BoringSSL never *lists*
+/// this directory. It builds `<dir>/<subject-hash>.<n>` and opens that path directly
+/// (`by_dir.c:321`), so nothing short of knowing every subject hash in advance could prove the
+/// directory holds usable anchors. "Holds at least one readable entry" is a proxy for "somebody
+/// populated this", which is the misconfiguration being caught — a directory of unrelated files
+/// passes, and that is an accepted limit (see the module docs).
+///
+/// Requires an entry that actually *read*: `next().is_some()` would also accept a `Some(Err(_))`
+/// from a directory whose contents cannot be enumerated, which is a false pass in a check whose
+/// whole job is not producing them.
+fn holds_an_entry(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.any(|entry| entry.is_ok()))
 }
 
 // The four values below come from BoringSSL rather than being hardcoded, so they always match the
@@ -193,9 +229,15 @@ mod tests {
         // The whole point of asking the library: a hardcoded path would drift from whatever this build
         // was compiled with. Assert they are real absolute paths rather than specific strings, which
         // would just re-hardcode the assumption inside the test.
-        let sources = default_trust_anchor_sources();
-        assert!(sources.file.0.is_absolute(), "{:?}", sources.file.0);
-        assert!(sources.dir.0.is_absolute(), "{:?}", sources.dir.0);
+        //
+        // Against the compiled-in defaults directly, not through `default_trust_anchor_sources()`,
+        // which layers the ambient environment on top: a runner with `SSL_CERT_DIR=` set would fail
+        // `is_absolute` for a reason that says nothing about this code. Env resolution is covered by
+        // `an_empty_env_var_suppresses_the_builtin_default`, on explicit values.
+        let file = boringssl_default_cert_file();
+        let dir = boringssl_default_cert_dir();
+        assert!(Path::new(&file).is_absolute(), "{file:?}");
+        assert!(Path::new(&dir).is_absolute(), "{dir:?}");
         assert!(!boringssl_default_cert_file_env().is_empty());
         assert!(!boringssl_default_cert_dir_env().is_empty());
     }
@@ -241,26 +283,30 @@ mod tests {
     fn a_missing_or_empty_directory_is_not_usable() {
         let missing = std::env::temp_dir().join("flint-anchors-test-does-not-exist");
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(!is_non_empty_dir(&missing));
+        assert!(!holds_an_entry(&missing));
 
         std::fs::create_dir_all(&missing).unwrap();
         assert!(
-            !is_non_empty_dir(&missing),
+            !holds_an_entry(&missing),
             "an empty directory holds no anchors"
         );
         std::fs::write(missing.join("anchor.0"), b"x").unwrap();
-        assert!(is_non_empty_dir(&missing));
+        assert!(holds_an_entry(&missing));
         let _ = std::fs::remove_dir_all(&missing);
     }
 
     #[test]
     fn the_error_says_what_to_do_about_it() {
         // A misconfigured embedder reads this string at 3am; it has to name the paths *and* the fix.
+        let at = |p: &str| AnchorSource {
+            path: PathBuf::from(p),
+            usable: false,
+            from_env: false,
+        };
         let unset = NoTrustAnchors {
             sources: TrustAnchorSources {
-                file: (PathBuf::from("/nope/cert.pem"), false),
-                dir: (PathBuf::from("/nope/certs"), false),
-                from_env: false,
+                file: at("/nope/cert.pem"),
+                dir: at("/nope/certs"),
             },
         };
         let msg = unset.to_string();
@@ -274,31 +320,54 @@ mod tests {
         // telling an embedder to set a variable they already set would send them the wrong way.
         let misconfigured = NoTrustAnchors {
             sources: TrustAnchorSources {
-                from_env: true,
-                ..unset.sources.clone()
+                file: AnchorSource {
+                    from_env: true,
+                    ..at("/nope/cert.pem")
+                },
+                dir: at("/nope/certs"),
             },
         };
         assert!(
             misconfigured
                 .to_string()
                 .contains("points at nothing usable"),
-            "{}",
-            misconfigured
+            "{misconfigured}"
         );
 
-        // An empty value would otherwise print as a blank path — say what it actually did instead.
+        // An empty override would otherwise print as a blank path — say what it actually did, and name
+        // the variable that did it, since only one of the two may be at fault.
         let blank = NoTrustAnchors {
             sources: TrustAnchorSources {
-                file: (PathBuf::new(), false),
-                dir: (PathBuf::new(), false),
-                from_env: true,
+                file: AnchorSource {
+                    path: PathBuf::new(),
+                    usable: false,
+                    from_env: true,
+                },
+                dir: at("/etc/ssl/certs"),
+            },
+        };
+        let msg = blank.to_string();
+        assert!(
+            msg.contains("SSL_CERT_FILE is set to an empty value"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("SSL_CERT_DIR is set to an empty value"),
+            "the untouched source must not be blamed: {msg}"
+        );
+
+        // A blank path that did *not* come from an override cannot have suppressed anything — the
+        // compiled-in defaults are literal concatenations and are never empty — so fall back to
+        // neutral wording rather than asserting a cause that did not happen.
+        let blank_default = NoTrustAnchors {
+            sources: TrustAnchorSources {
+                file: at(""),
+                dir: at(""),
             },
         };
         assert!(
-            blank
-                .to_string()
-                .contains("suppresses the built-in default"),
-            "{blank}"
+            !blank_default.to_string().contains("suppresses"),
+            "{blank_default}"
         );
     }
 }
