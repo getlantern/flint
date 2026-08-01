@@ -440,13 +440,27 @@ keeps every channel simple.
   authenticates the front whose certificate actually arrives. Verification failure hard-fails that
   resolver's attempt, which the pool race already treats as one candidate losing, so no separate
   down-ranking was needed.
-- **Trust anchors on mobile.** Empty `DialPolicy::roots` falls back to OpenSSL's default paths, which
-  are empty on Android/iOS unless the embedder points `SSL_CERT_FILE`/`SSL_CERT_DIR` at a bundled set
-  (as the spark embedder does in its own repo — see §6.1). That coupling is implicit: flint cannot tell
-  whether an embedder
-  has done it, and gets an indistinguishable "unable to get local issuer certificate" either way. Open:
-  whether flint should expose a cheap self-check (verify one known-good anchor at startup) so a
-  misconfigured embedder fails loudly at init instead of looking like a blocked network.
+- ~~**Trust anchors on mobile.**~~ **Done** — empty `DialPolicy::roots` falls back to OpenSSL's default
+  paths, which are empty on Android/iOS unless the embedder points `SSL_CERT_FILE`/`SSL_CERT_DIR` at a
+  bundled set (as the spark embedder does in its own repo — see §6.1). That coupling was implicit, and a
+  missing store yields an "unable to get local issuer certificate" indistinguishable from a censored
+  network — worse, the proxyless search reads those failures as evidence about *strategies* and keeps
+  searching, so a local misconfiguration presents as a network that blocks everything.
+  `flint_tls::trust_store::check_default_trust_anchors()` turns it into a loud, specific error at init.
+  Three design points worth keeping:
+  - It asks **BoringSSL** for its own paths and env-var names (`X509_get_default_cert_file`/`_dir`/
+    `_env`) rather than hardcoding `/etc/ssl/...`, so it cannot drift from the build actually linked in.
+  - It applies BoringSSL's real precedence rule, which is `getenv() != NULL` — **not** "non-empty". An
+    empty `SSL_CERT_FILE=""` still beats the compiled-in default and then fails to load, so reading
+    empty as unset would pass a check the library is about to fail (`by_file.c:88`, `by_dir.c:119`).
+  - It proves only that a source **exists and is non-empty**, not that any particular root is present.
+    A pass does not promise verification succeeds; a failure does promise it will not. Verifying a
+    known-good anchor for real would mean shipping a pinned cert to validate against, which buys little
+    over this for the misconfiguration it actually targets.
+
+  It is deliberately not called automatically — a caller pinning `roots_pem` never consults the default
+  paths and should not be warned about them. Open: whether the spark embedder should call it at init on
+  mobile and surface the error in the UI rather than logging it.
 
 ## 12. References
 

@@ -27,6 +27,8 @@ pub mod profile;
 pub mod anchor;
 #[cfg(feature = "boring")]
 pub mod connector;
+#[cfg(feature = "boring")]
+pub mod trust_store;
 
 pub use profile::Profile;
 
@@ -51,3 +53,5 @@ pub enum CertVerification {
 
 #[cfg(feature = "boring")]
 pub use connector::{configure, connect, connect_with};
+#[cfg(feature = "boring")]
+pub use trust_store::{check_default_trust_anchors, NoTrustAnchors, TrustAnchorSources};
