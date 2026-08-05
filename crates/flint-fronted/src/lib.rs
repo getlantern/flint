@@ -2777,29 +2777,51 @@ providers:
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut conn = h2::server::handshake(server).await.unwrap();
-            if let Some(Ok((request, mut respond))) = conn.accept().await {
-                let authority = request
-                    .uri()
-                    .authority()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
-                let host = request
-                    .headers()
-                    .get(http::header::HOST)
-                    .map(|v| v.to_str().unwrap_or("<non-utf8>").to_owned());
-                let mut send = respond
-                    .send_response(Response::builder().status(200).body(()).unwrap(), false)
-                    .unwrap();
-                send.send_data(Bytes::from_static(b"ok"), true).unwrap();
-                let _ = seen_tx.send((authority, host));
+            // Handle the request in its own task and keep polling `accept`, which is what drives the
+            // server connection. Draining the body inline instead deadlocks: the DATA frames cannot
+            // arrive while the connection is not being polled. This is the pattern the neighbouring
+            // tests use, for the same reason.
+            if let Some(Ok(accepted)) = conn.accept().await {
+                tokio::spawn(async move {
+                    let (request, mut respond) = accepted;
+                    let authority = request
+                        .uri()
+                        .authority()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    let host = request
+                        .headers()
+                        .get(http::header::HOST)
+                        .map(|v| v.to_str().unwrap_or("<non-utf8>").to_owned());
+                    let mut send = respond
+                        .send_response(Response::builder().status(200).body(()).unwrap(), false)
+                        .unwrap();
+                    // Drain the request body — dropping a `RecvStream` unread can trigger an
+                    // implicit RST_STREAM and make this flaky.
+                    let mut body = request.into_body();
+                    let mut got = Vec::new();
+                    while let Some(Ok(chunk)) = body.data().await {
+                        got.extend_from_slice(&chunk);
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                    }
+                    send.send_data(Bytes::from_static(b"ok"), true).unwrap();
+                    let _ = seen_tx.send((authority, host, got));
+                });
             }
             while conn.accept().await.is_some() {}
         });
 
         let req = OneshotRequest::post("/api/v1/config-new", Bytes::from_static(b"{}"));
-        let _ = h2_oneshot(client, "origin.example.net", &req).await;
+        // Assert the request *succeeds* as well as having the right header shape. Ignoring this
+        // result would let a broken `h2_oneshot` pass so long as the headers still arrived — a poor
+        // trade in a change whose entire subject is a request that errors at the h2 layer.
+        let resp = h2_oneshot(client, "origin.example.net", &req)
+            .await
+            .expect("the request completes");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
 
-        let (authority, host) = seen_rx.await.expect("server observed the request");
+        let (authority, host, body) = seen_rx.await.expect("server observed the request");
         assert_eq!(
             authority, "origin.example.net",
             "the host must travel in :authority"
@@ -2808,6 +2830,7 @@ providers:
             host, None,
             "a `host` header alongside :authority makes GFE reset the stream"
         );
+        assert_eq!(body, b"{}", "the body still reaches the server");
     }
 
     #[tokio::test]
