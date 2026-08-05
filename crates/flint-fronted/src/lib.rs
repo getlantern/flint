@@ -1139,13 +1139,22 @@ where
         let _ = connection.await;
     }));
 
+    // No explicit `host` header. The URI above already supplies `:authority`, which is what carries
+    // the host in HTTP/2 — RFC 9113 §8.3.1 says clients generating h2 directly SHOULD use `:authority`
+    // rather than `Host`. Sending both is redundant at best, and Google's frontend rejects it: a
+    // request to a GFE-served origin carrying `host` alongside `:authority` is answered with
+    // RST_STREAM PROTOCOL_ERROR, while the identical request without it gets a normal HTTP response.
+    //
+    // Isolated with a 2x2 against the live origin (host present/absent x content-length present/absent,
+    // 2026-08-05): both `host` rows reset, both no-`host` rows returned HTTP 400. `content-length` made
+    // no difference. Akamai tolerates the header, which is why the fronted path worked and only a
+    // direct-origin caller saw it.
     let mut builder = Request::builder()
         .method(req.method.clone())
-        .uri(format!("https://{authority}{}", normalize_path(&req.path)))
-        .header(http::header::HOST, authority);
+        .uri(format!("https://{authority}{}", normalize_path(&req.path)));
     for (name, value) in &req.headers {
-        // The Host/:authority is derived from the connection authority above; a caller-supplied host
-        // would duplicate or override it and break fronting, so skip it (see OneshotRequest::header).
+        // `:authority` comes from the connection authority in the URI above; a caller-supplied host
+        // would duplicate it and break fronting, so skip it (see OneshotRequest::header).
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
@@ -2741,6 +2750,52 @@ providers:
             err,
             Error::NoUsableFronts { ref host } if host == "api.example.com"
         ));
+    }
+
+    /// `h2_oneshot` must carry the host in `:authority` only, never as a `host` header.
+    ///
+    /// Google's frontend answers a request bearing both with RST_STREAM PROTOCOL_ERROR, so this is
+    /// not a style preference — it decides whether a direct-origin caller works at all. Isolated with
+    /// a 2x2 against a live GFE origin: both `host` rows reset, both no-`host` rows returned a normal
+    /// HTTP status, and `content-length` made no difference. Akamai tolerates it, which is why only
+    /// callers dialling an origin directly ever saw the failure.
+    #[tokio::test]
+    async fn h2_oneshot_sends_authority_without_a_host_header() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            if let Some(Ok((request, mut respond))) = conn.accept().await {
+                let authority = request
+                    .uri()
+                    .authority()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let host = request
+                    .headers()
+                    .get(http::header::HOST)
+                    .map(|v| v.to_str().unwrap_or("<non-utf8>").to_owned());
+                let mut send = respond
+                    .send_response(Response::builder().status(200).body(()).unwrap(), false)
+                    .unwrap();
+                send.send_data(Bytes::from_static(b"ok"), true).unwrap();
+                let _ = seen_tx.send((authority, host));
+            }
+            while conn.accept().await.is_some() {}
+        });
+
+        let req = OneshotRequest::post("/api/v1/config-new", Bytes::from_static(b"{}"));
+        let _ = h2_oneshot(client, "origin.example.net", &req).await;
+
+        let (authority, host) = seen_rx.await.expect("server observed the request");
+        assert_eq!(
+            authority, "origin.example.net",
+            "the host must travel in :authority"
+        );
+        assert_eq!(
+            host, None,
+            "a `host` header alongside :authority makes GFE reset the stream"
+        );
     }
 
     #[tokio::test]
