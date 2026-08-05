@@ -51,11 +51,6 @@ where
         // either). Cloudflare leads the default pool as the high-collateral spearhead, so omitting this
         // silently disabled the pool's most valuable entries while the survivors made it look healthy.
         .header(http::header::CONTENT_LENGTH, dns_query.len())
-        // Required in practice, though HTTP/2 delimits the body with END_STREAM and RFC 8484 does not
-        // demand it. Cloudflare and Mullvad answer a DoH POST without `content-length` with 400 Bad
-        // Request (measured 2026-08-05: both 400 without it, both 200 with it; Quad9 and Google accept
-        // either). Cloudflare leads the default pool as the high-collateral spearhead, so omitting this
-        // silently disabled the pool's most valuable entries while the survivors made it look healthy.
         .body(())
         .map_err(to_io)?;
 
