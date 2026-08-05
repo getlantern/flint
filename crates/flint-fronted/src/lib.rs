@@ -2643,7 +2643,13 @@ providers:
                             let (request, mut respond) = accepted;
                             assert_eq!(request.method(), Method::POST);
                             assert_eq!(request.uri().path(), "/api/v1/config-new");
-                            assert_eq!(request.headers()[http::header::HOST], "df.iantem.io");
+                            // `:authority` carries the host; no `host` header is sent — see
+                            // `h2_oneshot_sends_authority_without_a_host_header`.
+                            assert_eq!(
+                                request.uri().authority().map(|a| a.as_str()),
+                                Some("df.iantem.io")
+                            );
+                            assert!(request.headers().get(http::header::HOST).is_none());
                             // Read the body FIRST, then respond — the config-new ordering.
                             let mut body = request.into_body();
                             let chunk = body.data().await.unwrap().unwrap();
@@ -2708,7 +2714,13 @@ providers:
                         let accepted = h2.accept().await.unwrap().unwrap();
                         tokio::spawn(async move {
                             let (request, mut respond) = accepted;
-                            assert_eq!(request.headers()[http::header::HOST], "origin.example.net");
+                            // `:authority` carries the fronted host; no `host` header is sent —
+                            // see `h2_oneshot_sends_authority_without_a_host_header`.
+                            assert_eq!(
+                                request.uri().authority().map(|a| a.as_str()),
+                                Some("origin.example.net")
+                            );
+                            assert!(request.headers().get(http::header::HOST).is_none());
                             let mut body = request.into_body();
                             let chunk = body.data().await.unwrap().unwrap();
                             assert_eq!(&chunk[..], b"hello");
