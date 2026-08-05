@@ -3012,10 +3012,12 @@ providers:
         let transports: Vec<Box<dyn BoxedConnectionTransport>> = vec![Box::new(MemoryTransport)];
         assert_eq!(transports[0].name(), "memory");
 
-        let mut conn = transports[0]
+        let (mut conn, alpn) = transports[0]
             .connect_boxed("api.example.com")
             .await
             .unwrap();
+        // This transport does not override `connect_alpn`, so it reports nothing rather than guessing.
+        assert_eq!(alpn, None);
         conn.write_all(b"ping").await.unwrap();
         let mut out = [0; 4];
         conn.read_exact(&mut out).await.unwrap();

@@ -24,13 +24,33 @@ pub trait ConnectionTransport {
     fn name(&self) -> &str;
 
     async fn connect(&self, host: &str) -> io::Result<Self::Stream>;
+
+    /// Like [`connect`](Self::connect), but also reports the ALPN protocol the peer negotiated
+    /// (e.g. `b"h2"`, `b"http/1.1"`), so a consumer layering HTTP over the returned stream can pick
+    /// its version from what actually happened rather than from what usually happens.
+    ///
+    /// Override this on any transport whose TLS offers ALPN. The default reports `None`, which means
+    /// only *"this transport cannot say"* — never *"nothing was negotiated"*. A consumer should read
+    /// `None` as "fall back to the version you were built to speak", not as "assume HTTP/1.1".
+    ///
+    /// Why this lives on the transport rather than the stream: [`Connection`] is blanket-implemented
+    /// for every `AsyncRead + AsyncWrite`, so it cannot be specialized to expose ALPN per stream
+    /// type, and [`BoxedConnection`] erases the concrete type before a consumer could downcast to
+    /// something like `flint_dial::AlpnStream`. The transport is the last layer that still knows.
+    async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)>
+    where
+        Self: Sync,
+    {
+        Ok((self.connect(host).await?, None))
+    }
 }
 
 #[async_trait]
 pub trait BoxedConnectionTransport: Send + Sync {
     fn name(&self) -> &str;
 
-    async fn connect_boxed(&self, host: &str) -> io::Result<BoxedConnection>;
+    /// Connect and report the negotiated ALPN — see [`ConnectionTransport::connect_alpn`].
+    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, Option<Vec<u8>>)>;
 }
 
 #[async_trait]
@@ -42,8 +62,9 @@ where
         ConnectionTransport::name(self)
     }
 
-    async fn connect_boxed(&self, host: &str) -> io::Result<BoxedConnection> {
-        Ok(Box::new(self.connect(host).await?))
+    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, Option<Vec<u8>>)> {
+        let (stream, alpn) = self.connect_alpn(host).await?;
+        Ok((Box::new(stream), alpn))
     }
 }
 
@@ -66,6 +87,21 @@ pub struct TransportConnection {
     pub stream: BoxedConnection,
     pub transport: String,
     pub index: usize,
+    /// The ALPN protocol the winning transport negotiated, when it can say — see
+    /// [`ConnectionTransport::connect_alpn`]. `None` means unreported, not "none negotiated".
+    pub alpn: Option<Vec<u8>>,
+}
+
+impl TransportConnection {
+    /// Whether the winner negotiated HTTP/2.
+    ///
+    /// Deliberately false for `None`: a transport that cannot report its ALPN has not told you it
+    /// speaks h2, and writing HTTP/2 preface bytes at an HTTP/1.1 peer fails in a way that does not
+    /// look like a protocol error — the response never terminates, so it surfaces as a hang or a
+    /// "no header terminator" parse failure much later.
+    pub fn is_h2(&self) -> bool {
+        self.alpn.as_deref() == Some(b"h2")
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,11 +156,12 @@ pub async fn race_boxed(
         }
 
         match set.next().await {
-            Some((index, transport, Ok(stream))) => {
+            Some((index, transport, Ok((stream, alpn)))) => {
                 return Ok(TransportConnection {
                     stream,
                     transport,
                     index,
+                    alpn,
                 });
             }
             Some((_index, transport, Err(err))) => {
@@ -179,6 +216,78 @@ mod tests {
             });
             Ok(client)
         }
+    }
+
+    /// A transport that knows what its TLS negotiated and says so.
+    struct AlpnTransport(&'static [u8]);
+
+    #[async_trait]
+    impl ConnectionTransport for AlpnTransport {
+        type Stream = tokio::io::DuplexStream;
+
+        fn name(&self) -> &str {
+            "alpn"
+        }
+
+        async fn connect(&self, _host: &str) -> io::Result<Self::Stream> {
+            Ok(tokio::io::duplex(8).0)
+        }
+
+        async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
+            Ok((self.connect(host).await?, Some(self.0.to_vec())))
+        }
+    }
+
+    /// The compatibility claim behind the provided method: a transport written before `connect_alpn`
+    /// existed still compiles and simply reports nothing.
+    #[tokio::test]
+    async fn a_transport_that_does_not_override_reports_no_alpn() {
+        let transports: Vec<Box<dyn BoxedConnectionTransport>> = vec![Box::new(MemoryTransport {
+            name: "memory",
+            fail: false,
+        })];
+        let conn = race_boxed("api.example.com", &transports, RaceOptions::default())
+            .await
+            .expect("connects");
+        assert_eq!(conn.alpn, None);
+        assert!(!conn.is_h2(), "unreported ALPN must not read as h2");
+    }
+
+    #[tokio::test]
+    async fn the_winners_alpn_reaches_the_caller() {
+        let transports: Vec<Box<dyn BoxedConnectionTransport>> =
+            vec![Box::new(AlpnTransport(b"h2"))];
+        let conn = race_boxed("api.example.com", &transports, RaceOptions::default())
+            .await
+            .expect("connects");
+        assert_eq!(conn.alpn.as_deref(), Some(&b"h2"[..]));
+        assert!(conn.is_h2());
+    }
+
+    /// The ALPN must belong to the transport that actually won, not to whichever was listed first —
+    /// that is the entire point of carrying it on the connection rather than assuming per transport.
+    #[tokio::test]
+    async fn the_alpn_follows_the_winner_not_the_order() {
+        let transports: Vec<Box<dyn BoxedConnectionTransport>> = vec![
+            Box::new(MemoryTransport {
+                name: "blocked",
+                fail: true,
+            }),
+            Box::new(AlpnTransport(b"http/1.1")),
+        ];
+        let conn = race_boxed(
+            "api.example.com",
+            &transports,
+            RaceOptions {
+                window: 1,
+                attempt_timeout: None,
+            },
+        )
+        .await
+        .expect("second transport wins");
+        assert_eq!(conn.transport, "alpn");
+        assert_eq!(conn.alpn.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(!conn.is_h2());
     }
 
     #[tokio::test]
