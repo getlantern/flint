@@ -45,6 +45,17 @@ where
         .uri(format!("https://{host}{path}"))
         .header(http::header::CONTENT_TYPE, "application/dns-message")
         .header(http::header::ACCEPT, "application/dns-message")
+        // Required in practice, though HTTP/2 delimits the body with END_STREAM and RFC 8484 does not
+        // demand it. Cloudflare and Mullvad answer a DoH POST without `content-length` with 400 Bad
+        // Request (measured 2026-08-05: both 400 without it, both 200 with it; Quad9 and Google accept
+        // either). Cloudflare leads the default pool as the high-collateral spearhead, so omitting this
+        // silently disabled the pool's most valuable entries while the survivors made it look healthy.
+        .header(http::header::CONTENT_LENGTH, dns_query.len())
+        // Required in practice, though HTTP/2 delimits the body with END_STREAM and RFC 8484 does not
+        // demand it. Cloudflare and Mullvad answer a DoH POST without `content-length` with 400 Bad
+        // Request (measured 2026-08-05: both 400 without it, both 200 with it; Quad9 and Google accept
+        // either). Cloudflare leads the default pool as the high-collateral spearhead, so omitting this
+        // silently disabled the pool's most valuable entries while the survivors made it look healthy.
         .body(())
         .map_err(to_io)?;
 
@@ -94,6 +105,18 @@ mod tests {
                 let (request, mut respond) = accepted.unwrap();
                 assert_eq!(request.method(), Method::POST);
                 assert_eq!(request.uri().path(), "/dns-query");
+                // Cloudflare and Mullvad answer 400 to a DoH POST without `content-length`, so it is
+                // not optional in practice even though END_STREAM already delimits the body. Asserted
+                // here because the failure it prevents is remote, silent, and operator-specific:
+                // nothing in a local test would otherwise notice its absence.
+                let declared = request
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .expect("DoH POST must send content-length")
+                    .to_str()
+                    .expect("content-length is ASCII")
+                    .parse::<usize>()
+                    .expect("content-length is a number");
                 let mut body = request.into_body();
                 let mut got = Vec::new();
                 while let Some(chunk) = poll_fn(|cx| body.poll_data(cx)).await {
@@ -105,6 +128,7 @@ mod tests {
                     .send_response(Response::builder().status(200).body(()).unwrap(), false)
                     .unwrap();
                 send.send_data(Bytes::from(canned), true).unwrap();
+                assert_eq!(declared, got.len(), "content-length must match the body");
                 let _ = tx.send(got);
             }
             // Keep driving the connection so the client can read the response.
