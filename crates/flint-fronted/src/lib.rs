@@ -3016,7 +3016,7 @@ providers:
             .connect_boxed("api.example.com")
             .await
             .unwrap();
-        // This transport does not override `connect_alpn`, so it reports nothing rather than guessing.
+        // This transport does not override `connect_alpn`, so no ALPN is known — reported, not guessed.
         assert_eq!(alpn, None);
         conn.write_all(b"ping").await.unwrap();
         let mut out = [0; 4];

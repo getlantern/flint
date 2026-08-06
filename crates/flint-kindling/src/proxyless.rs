@@ -147,7 +147,7 @@ impl ConnectionTransport for ProxylessTransport {
     }
 
     async fn connect(&self, host: &str) -> io::Result<Self::Stream> {
-        Ok(self.dial(host).await?.0)
+        self.dial(host).await
     }
 
     /// Reports the protocol the destination actually chose.
@@ -157,24 +157,29 @@ impl ConnectionTransport for ProxylessTransport {
     /// property of the peer, not of this transport. A consumer that hardcodes h2 because "a modern
     /// origin picks h2" is right until it meets an edge that answers http/1.1 — and that failure does
     /// not look like a protocol mismatch, it looks like a response that never terminates.
+    ///
+    /// The `Vec` is allocated here rather than in [`dial`](Self::dial) so
+    /// [`connect`](ConnectionTransport::connect), which would only discard it, does not pay for it.
     async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
-        let (stream, alpn) = self.dial(host).await?;
+        let stream = self.dial(host).await?;
+        let alpn = stream.alpn().map(<[u8]>::to_vec);
         Ok((stream, alpn))
     }
 }
 
 impl ProxylessTransport {
     /// Shared body of [`connect`](ConnectionTransport::connect) and
-    /// [`connect_alpn`](ConnectionTransport::connect_alpn): search (or reuse a cached winner), then
-    /// report the stream alongside the ALPN it negotiated.
-    async fn dial(&self, host: &str) -> io::Result<(flint_proxyless::AlpnStream, Option<Vec<u8>>)> {
+    /// [`connect_alpn`](ConnectionTransport::connect_alpn): search, or reuse a cached winner.
+    ///
+    /// The returned stream still carries its negotiated ALPN — reading it is the caller's choice, so
+    /// the non-reporting path costs nothing.
+    async fn dial(&self, host: &str) -> io::Result<flint_proxyless::AlpnStream> {
         let space = self.search_space();
         let (_strategy, stream) =
             flint_proxyless::connect_cached(&space, host, self.port, &self.cache, &self.network)
                 .await
                 .map_err(io::Error::other)?;
-        let alpn = stream.alpn().map(<[u8]>::to_vec);
-        Ok((stream, alpn))
+        Ok(stream)
     }
 }
 

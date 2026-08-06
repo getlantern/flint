@@ -29,9 +29,16 @@ pub trait ConnectionTransport {
     /// (e.g. `b"h2"`, `b"http/1.1"`), so a consumer layering HTTP over the returned stream can pick
     /// its version from what actually happened rather than from what usually happens.
     ///
-    /// Override this on any transport whose TLS offers ALPN. The default reports `None`, which means
-    /// only *"this transport cannot say"* — never *"nothing was negotiated"*. A consumer should read
-    /// `None` as "fall back to the version you were built to speak", not as "assume HTTP/1.1".
+    /// Override this on any transport whose TLS offers ALPN.
+    ///
+    /// **`None` is one state, not two.** It means *no negotiated protocol is known* — whether because
+    /// this transport does not report one, or because the peer selected none. The two are
+    /// deliberately not distinguished: a transport forwarding `flint_dial::AlpnStream::alpn` cannot
+    /// tell them apart anyway, so a contract that claimed to would be one no implementation honours.
+    ///
+    /// Either way the consumer's move is the same — **fall back to the version you were built to
+    /// speak**. Do not read `None` as evidence about the wire; in particular it is not a statement
+    /// that the peer wants HTTP/1.1, only that nothing said otherwise.
     ///
     /// Why this lives on the transport rather than the stream: [`Connection`] is blanket-implemented
     /// for every `AsyncRead + AsyncWrite`, so it cannot be specialized to expose ALPN per stream
@@ -87,18 +94,22 @@ pub struct TransportConnection {
     pub stream: BoxedConnection,
     pub transport: String,
     pub index: usize,
-    /// The ALPN protocol the winning transport negotiated, when it can say — see
-    /// [`ConnectionTransport::connect_alpn`]. `None` means unreported, not "none negotiated".
+    /// The ALPN protocol the winning transport negotiated, if any is known.
+    ///
+    /// `None` covers both "this transport does not report ALPN" and "the peer negotiated none" —
+    /// a single state on purpose, since a transport forwarding
+    /// `flint_dial::AlpnStream::alpn` cannot separate them. See
+    /// [`ConnectionTransport::connect_alpn`] for what a consumer should do with it.
     pub alpn: Option<Vec<u8>>,
 }
 
 impl TransportConnection {
     /// Whether the winner negotiated HTTP/2.
     ///
-    /// Deliberately false for `None`: a transport that cannot report its ALPN has not told you it
-    /// speaks h2, and writing HTTP/2 preface bytes at an HTTP/1.1 peer fails in a way that does not
-    /// look like a protocol error — the response never terminates, so it surfaces as a hang or a
-    /// "no header terminator" parse failure much later.
+    /// Deliberately false for `None`: no h2 was reported, so nothing has told you the peer speaks
+    /// it. Writing HTTP/2 preface bytes at an HTTP/1.1 peer fails in a way that does not look like a
+    /// protocol error — the response never terminates, so it surfaces as a hang or a "no header
+    /// terminator" parse failure much later. Guessing in this direction is the expensive one.
     pub fn is_h2(&self) -> bool {
         self.alpn.as_deref() == Some(b"h2")
     }
@@ -250,7 +261,7 @@ mod tests {
             .await
             .expect("connects");
         assert_eq!(conn.alpn, None);
-        assert!(!conn.is_h2(), "unreported ALPN must not read as h2");
+        assert!(!conn.is_h2(), "an unknown ALPN must not read as h2");
     }
 
     #[tokio::test]
