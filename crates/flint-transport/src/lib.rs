@@ -25,30 +25,71 @@ pub trait ConnectionTransport {
 
     async fn connect(&self, host: &str) -> io::Result<Self::Stream>;
 
-    /// Like [`connect`](Self::connect), but also reports the ALPN protocol the peer negotiated
-    /// (e.g. `b"h2"`, `b"http/1.1"`), so a consumer layering HTTP over the returned stream can pick
-    /// its version from what actually happened rather than from what usually happens.
+    /// Like [`connect`](Self::connect), but also reports what the transport learned while
+    /// establishing the connection — see [`ConnectionInfo`].
     ///
-    /// Override this on any transport whose TLS offers ALPN.
+    /// Override this on any transport that knows something the HTTP layer above it needs: the ALPN
+    /// its TLS negotiated, or the authority a request over this connection must be addressed to.
     ///
-    /// **`None` is one state, not two.** It means *no negotiated protocol is known* — whether because
-    /// this transport does not report one, or because the peer selected none. The two are
-    /// deliberately not distinguished: a transport forwarding `flint_dial::AlpnStream::alpn` cannot
-    /// tell them apart anyway, so a contract that claimed to would be one no implementation honours.
-    ///
-    /// Either way the consumer's move is the same — **fall back to the version you were built to
-    /// speak**. Do not read `None` as evidence about the wire; in particular it is not a statement
-    /// that the peer wants HTTP/1.1, only that nothing said otherwise.
+    /// The default reports nothing, which is the honest answer for a transport that has nothing to
+    /// add. It is **not** a set of defaults to act on: an absent field means "this transport cannot
+    /// say", so the consumer falls back to what it already knows, rather than treating the absence as
+    /// evidence about the wire.
     ///
     /// Why this lives on the transport rather than the stream: [`Connection`] is blanket-implemented
-    /// for every `AsyncRead + AsyncWrite`, so it cannot be specialized to expose ALPN per stream
-    /// type, and [`BoxedConnection`] erases the concrete type before a consumer could downcast to
-    /// something like `flint_dial::AlpnStream`. The transport is the last layer that still knows.
-    async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)>
+    /// for every `AsyncRead + AsyncWrite`, so it cannot be specialized per stream type, and
+    /// [`BoxedConnection`] erases the concrete type before a consumer could downcast to something like
+    /// `flint_dial::AlpnStream`. The transport is the last layer that still knows.
+    async fn connect_info(&self, host: &str) -> io::Result<(Self::Stream, ConnectionInfo)>
     where
         Self: Sync,
     {
-        Ok((self.connect(host).await?, None))
+        Ok((self.connect(host).await?, ConnectionInfo::default()))
+    }
+}
+
+/// What a transport learned while connecting, beyond the byte stream itself.
+///
+/// These are facts the transport holds and the protocol layered above it needs, which the trait
+/// boundary would otherwise destroy. Grouped rather than returned as a widening tuple so that adding
+/// the next one is a new field instead of another signature change at every implementor.
+///
+/// Every field is optional and `None` means **"this transport cannot say"**, never a default worth
+/// acting on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// The ALPN protocol the peer negotiated (e.g. `b"h2"`, `b"http/1.1"`), so a consumer picks its
+    /// HTTP version from what actually happened rather than from what usually happens.
+    ///
+    /// One state, not two: it covers both "this transport does not report ALPN" and "the peer
+    /// selected none". A transport forwarding `flint_dial::AlpnStream::alpn` cannot separate them, so
+    /// a contract claiming to would be one no implementation honours.
+    pub alpn: Option<Vec<u8>>,
+
+    /// The host a request over this connection must be addressed to (`:authority` / `Host`), when
+    /// that differs from the host the caller asked for.
+    ///
+    /// Domain fronting is the case that needs this: the connection is made to a CDN edge, and the
+    /// request has to name the front's *inner* host for the edge to re-originate it — a different
+    /// name per provider. A consumer that addresses the host it asked for reaches the right edge and
+    /// gets the wrong routing, which looks like the CDN being blocked rather than a bug.
+    pub authority: Option<String>,
+}
+
+impl ConnectionInfo {
+    /// Whether the peer negotiated HTTP/2.
+    ///
+    /// Deliberately false for an unreported ALPN: nothing has said the peer speaks h2, and writing
+    /// HTTP/2 preface bytes at an HTTP/1.1 peer does not fail like a protocol error — the response
+    /// never terminates, surfacing as a hang or a "no header terminator" parse failure much later.
+    /// Guessing in this direction is the expensive one.
+    pub fn is_h2(&self) -> bool {
+        self.alpn.as_deref() == Some(b"h2")
+    }
+
+    /// The authority to address, falling back to `asked_for` when the transport has no opinion.
+    pub fn authority<'a>(&'a self, asked_for: &'a str) -> &'a str {
+        self.authority.as_deref().unwrap_or(asked_for)
     }
 }
 
@@ -56,8 +97,8 @@ pub trait ConnectionTransport {
 pub trait BoxedConnectionTransport: Send + Sync {
     fn name(&self) -> &str;
 
-    /// Connect and report the negotiated ALPN — see [`ConnectionTransport::connect_alpn`].
-    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, Option<Vec<u8>>)>;
+    /// Connect and report what the transport learned — see [`ConnectionTransport::connect_info`].
+    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, ConnectionInfo)>;
 }
 
 #[async_trait]
@@ -69,9 +110,9 @@ where
         ConnectionTransport::name(self)
     }
 
-    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, Option<Vec<u8>>)> {
-        let (stream, alpn) = self.connect_alpn(host).await?;
-        Ok((Box::new(stream), alpn))
+    async fn connect_boxed(&self, host: &str) -> io::Result<(BoxedConnection, ConnectionInfo)> {
+        let (stream, info) = self.connect_info(host).await?;
+        Ok((Box::new(stream), info))
     }
 }
 
@@ -94,24 +135,21 @@ pub struct TransportConnection {
     pub stream: BoxedConnection,
     pub transport: String,
     pub index: usize,
-    /// The ALPN protocol the winning transport negotiated, if any is known.
-    ///
-    /// `None` covers both "this transport does not report ALPN" and "the peer negotiated none" —
-    /// a single state on purpose, since a transport forwarding
-    /// `flint_dial::AlpnStream::alpn` cannot separate them. See
-    /// [`ConnectionTransport::connect_alpn`] for what a consumer should do with it.
-    pub alpn: Option<Vec<u8>>,
+    /// What the **winning** transport learned while connecting — see [`ConnectionInfo`]. Belongs to
+    /// the member that won, not to the list, which is the point of carrying it here.
+    pub info: ConnectionInfo,
 }
 
 impl TransportConnection {
-    /// Whether the winner negotiated HTTP/2.
-    ///
-    /// Deliberately false for `None`: no h2 was reported, so nothing has told you the peer speaks
-    /// it. Writing HTTP/2 preface bytes at an HTTP/1.1 peer fails in a way that does not look like a
-    /// protocol error — the response never terminates, so it surfaces as a hang or a "no header
-    /// terminator" parse failure much later. Guessing in this direction is the expensive one.
+    /// Whether the winner negotiated HTTP/2. See [`ConnectionInfo::is_h2`].
     pub fn is_h2(&self) -> bool {
-        self.alpn.as_deref() == Some(b"h2")
+        self.info.is_h2()
+    }
+
+    /// The authority to address a request over this connection to, falling back to `asked_for`.
+    /// See [`ConnectionInfo::authority`].
+    pub fn authority<'a>(&'a self, asked_for: &'a str) -> &'a str {
+        self.info.authority(asked_for)
     }
 }
 
@@ -167,12 +205,12 @@ pub async fn race_boxed(
         }
 
         match set.next().await {
-            Some((index, transport, Ok((stream, alpn)))) => {
+            Some((index, transport, Ok((stream, info)))) => {
                 return Ok(TransportConnection {
                     stream,
                     transport,
                     index,
-                    alpn,
+                    info,
                 });
             }
             Some((_index, transport, Err(err))) => {
@@ -244,12 +282,18 @@ mod tests {
             Ok(tokio::io::duplex(8).0)
         }
 
-        async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
-            Ok((self.connect(host).await?, Some(self.0.to_vec())))
+        async fn connect_info(&self, host: &str) -> io::Result<(Self::Stream, ConnectionInfo)> {
+            Ok((
+                self.connect(host).await?,
+                ConnectionInfo {
+                    alpn: Some(self.0.to_vec()),
+                    ..Default::default()
+                },
+            ))
         }
     }
 
-    /// The compatibility claim behind the provided method: a transport written before `connect_alpn`
+    /// The compatibility claim behind the provided method: a transport written before `connect_info`
     /// existed still compiles and simply reports nothing.
     #[tokio::test]
     async fn a_transport_that_does_not_override_reports_no_alpn() {
@@ -260,7 +304,7 @@ mod tests {
         let conn = race_boxed("api.example.com", &transports, RaceOptions::default())
             .await
             .expect("connects");
-        assert_eq!(conn.alpn, None);
+        assert_eq!(conn.info, ConnectionInfo::default());
         assert!(!conn.is_h2(), "an unknown ALPN must not read as h2");
     }
 
@@ -271,8 +315,55 @@ mod tests {
         let conn = race_boxed("api.example.com", &transports, RaceOptions::default())
             .await
             .expect("connects");
-        assert_eq!(conn.alpn.as_deref(), Some(&b"h2"[..]));
+        assert_eq!(conn.info.alpn.as_deref(), Some(&b"h2"[..]));
         assert!(conn.is_h2());
+    }
+
+    /// A transport that routes by a name the caller does not know must be able to say so, and the
+    /// caller must get its own host back when the transport has no opinion. Domain fronting is the
+    /// case: the request has to name the front's inner host, not the origin that was asked for.
+    #[tokio::test]
+    async fn the_authority_overrides_the_asked_for_host_only_when_reported() {
+        struct Fronted;
+
+        #[async_trait]
+        impl ConnectionTransport for Fronted {
+            type Stream = tokio::io::DuplexStream;
+
+            fn name(&self) -> &str {
+                "fronted"
+            }
+
+            async fn connect(&self, _host: &str) -> io::Result<Self::Stream> {
+                Ok(tokio::io::duplex(8).0)
+            }
+
+            async fn connect_info(&self, host: &str) -> io::Result<(Self::Stream, ConnectionInfo)> {
+                Ok((
+                    self.connect(host).await?,
+                    ConnectionInfo {
+                        authority: Some("api.dsa.example.net".into()),
+                        ..Default::default()
+                    },
+                ))
+            }
+        }
+
+        let fronted: Vec<Box<dyn BoxedConnectionTransport>> = vec![Box::new(Fronted)];
+        let conn = race_boxed("api.example.com", &fronted, RaceOptions::default())
+            .await
+            .expect("connects");
+        assert_eq!(conn.authority("api.example.com"), "api.dsa.example.net");
+
+        // A transport with no opinion must not rewrite the caller's host.
+        let plain: Vec<Box<dyn BoxedConnectionTransport>> = vec![Box::new(MemoryTransport {
+            name: "memory",
+            fail: false,
+        })];
+        let conn = race_boxed("api.example.com", &plain, RaceOptions::default())
+            .await
+            .expect("connects");
+        assert_eq!(conn.authority("api.example.com"), "api.example.com");
     }
 
     /// The ALPN must belong to the transport that actually won, not to whichever was listed first —
@@ -297,7 +388,7 @@ mod tests {
         .await
         .expect("second transport wins");
         assert_eq!(conn.transport, "alpn");
-        assert_eq!(conn.alpn.as_deref(), Some(&b"http/1.1"[..]));
+        assert_eq!(conn.info.alpn.as_deref(), Some(&b"http/1.1"[..]));
         assert!(!conn.is_h2());
     }
 

@@ -160,10 +160,18 @@ impl ConnectionTransport for ProxylessTransport {
     ///
     /// The `Vec` is allocated here rather than in [`dial`](Self::dial) so
     /// [`connect`](ConnectionTransport::connect), which would only discard it, does not pay for it.
-    async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
+    async fn connect_info(
+        &self,
+        host: &str,
+    ) -> io::Result<(Self::Stream, flint_transport::ConnectionInfo)> {
         let stream = self.dial(host).await?;
-        let alpn = stream.alpn().map(<[u8]>::to_vec);
-        Ok((stream, alpn))
+        let info = flint_transport::ConnectionInfo {
+            alpn: stream.alpn().map(<[u8]>::to_vec),
+            // No authority override: proxyless reaches the real destination directly, so the host the
+            // caller asked for is the host to address. Unlike a fronted connection there is no decoy.
+            authority: None,
+        };
+        Ok((stream, info))
     }
 }
 
