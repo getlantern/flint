@@ -157,12 +157,58 @@ impl TransportConnection {
 pub enum RaceError {
     #[error("no connection transports configured for `{host}`")]
     Empty { host: String },
+    /// `#[non_exhaustive]` because this variant just grew a field and broke that shape once already.
+    /// Only [`race_boxed`] constructs it, so nothing loses anything, and the next field costs
+    /// downstream nothing rather than a compile error.
+    ///
+    /// Applied to the variant, not the enum: enum-level would force every consumer to add a
+    /// catch-all arm today to guard against a variant nobody has proposed, which is a bigger
+    /// imposition than the problem.
     #[error("all {tried} connection transports failed for `{host}`: {errors}")]
+    #[non_exhaustive]
     AllFailed {
         host: String,
         tried: usize,
         errors: String,
+        /// The [`io::ErrorKind`] every member reported, when they all reported the same one.
+        ///
+        /// "They all timed out" and "they failed four different ways" are different diagnoses, and on
+        /// a censored network the difference is most of what a report is worth: the first says the
+        /// path is being blackholed, the second says the members failed for their own unrelated
+        /// reasons. Aggregating to a string alone throws that away, so the kind is kept separately.
+        ///
+        /// `None` when the members disagreed — no single kind can honestly describe the set.
+        kind: Option<io::ErrorKind>,
     },
+}
+
+impl RaceError {
+    /// The [`io::ErrorKind`] this failure should surface as.
+    ///
+    /// A unanimous member kind for [`AllFailed`](Self::AllFailed), otherwise [`Other`]. [`Empty`] is
+    /// [`InvalidInput`]: a race with no members is a caller mistake, not a network condition, and
+    /// reporting it like one sends people looking for a censor that is not there.
+    ///
+    /// [`Other`]: io::ErrorKind::Other
+    /// [`Empty`]: Self::Empty
+    /// [`InvalidInput`]: io::ErrorKind::InvalidInput
+    pub fn io_kind(&self) -> io::ErrorKind {
+        match self {
+            RaceError::Empty { .. } => io::ErrorKind::InvalidInput,
+            RaceError::AllFailed { kind, .. } => kind.unwrap_or(io::ErrorKind::Other),
+        }
+    }
+}
+
+impl From<RaceError> for io::Error {
+    /// Keeps both halves of the diagnosis: the aggregated per-member report as the error itself, and
+    /// the unanimous kind as the `ErrorKind`.
+    ///
+    /// Worth preferring over `io::Error::other`, which is the easy call at a `map_err` and silently
+    /// flattens every race failure to `Other`.
+    fn from(e: RaceError) -> Self {
+        io::Error::new(e.io_kind(), e)
+    }
 }
 
 pub async fn race_boxed(
@@ -180,6 +226,7 @@ pub async fn race_boxed(
     let mut set = FuturesUnordered::new();
     let mut next = 0;
     let mut errors = Vec::new();
+    let mut kinds: Vec<io::ErrorKind> = Vec::new();
 
     loop {
         while next < transports.len() && set.len() < window {
@@ -214,6 +261,7 @@ pub async fn race_boxed(
                 });
             }
             Some((_index, transport, Err(err))) => {
+                kinds.push(err.kind());
                 errors.push(format!("{transport}: {err}"));
             }
             None => {
@@ -221,9 +269,18 @@ pub async fn race_boxed(
                     host: host.to_owned(),
                     tried: transports.len(),
                     errors: join_errors(errors),
+                    kind: unanimous_kind(&kinds),
                 });
             }
         }
+    }
+}
+
+/// The one kind every member reported, or `None` if they disagreed (or there were none).
+fn unanimous_kind(kinds: &[io::ErrorKind]) -> Option<io::ErrorKind> {
+    match kinds.split_first() {
+        Some((first, rest)) if rest.iter().all(|k| k == first) => Some(*first),
+        _ => None,
     }
 }
 
@@ -317,6 +374,87 @@ mod tests {
             .expect("connects");
         assert_eq!(conn.info.alpn.as_deref(), Some(&b"h2"[..]));
         assert!(conn.is_h2());
+    }
+
+    /// A member that fails with a specific kind must be able to say so through the race — "they all
+    /// timed out" is a different diagnosis from "they failed four different ways", and on a censored
+    /// network that difference is most of what the report is worth.
+    #[tokio::test]
+    async fn a_unanimous_error_kind_survives_the_race() {
+        struct Dead(&'static str, io::ErrorKind);
+
+        #[async_trait]
+        impl ConnectionTransport for Dead {
+            type Stream = tokio::io::DuplexStream;
+
+            fn name(&self) -> &str {
+                self.0
+            }
+
+            async fn connect(&self, _host: &str) -> io::Result<Self::Stream> {
+                Err(io::Error::new(self.1, "blocked"))
+            }
+        }
+
+        let timed_out = io::ErrorKind::TimedOut;
+        let all_timeouts: Vec<Box<dyn BoxedConnectionTransport>> = vec![
+            Box::new(Dead("a", timed_out)),
+            Box::new(Dead("b", timed_out)),
+        ];
+        let err = race_boxed("api.example.com", &all_timeouts, RaceOptions::default())
+            .await
+            .map(|_| ())
+            .expect_err("both failed");
+        assert_eq!(err.io_kind(), timed_out);
+        // And it reaches an `io::Error` without the caller having to reach for it.
+        assert_eq!(io::Error::from(err).kind(), timed_out);
+
+        // Disagreeing members cannot honestly be summarised as any one kind.
+        let mixed: Vec<Box<dyn BoxedConnectionTransport>> = vec![
+            Box::new(Dead("a", io::ErrorKind::TimedOut)),
+            Box::new(Dead("b", io::ErrorKind::ConnectionRefused)),
+        ];
+        let err = race_boxed("api.example.com", &mixed, RaceOptions::default())
+            .await
+            .map(|_| ())
+            .expect_err("both failed");
+        assert_eq!(err.io_kind(), io::ErrorKind::Other);
+    }
+
+    /// An empty race is a caller mistake, not a network condition — reporting it as one sends people
+    /// looking for a censor that is not there.
+    #[tokio::test]
+    async fn an_empty_race_is_invalid_input_not_a_network_failure() {
+        let err = race_boxed("api.example.com", &[], RaceOptions::default())
+            .await
+            .map(|_| ())
+            .expect_err("no members");
+        assert_eq!(err.io_kind(), io::ErrorKind::InvalidInput);
+        assert_ne!(io::Error::from(err).kind(), io::ErrorKind::Other);
+    }
+
+    /// The aggregated per-member report must survive the `io::Error` conversion — the kind is the new
+    /// half, not a replacement for the messages.
+    #[tokio::test]
+    async fn the_io_error_keeps_the_per_member_report() {
+        let transports: Vec<Box<dyn BoxedConnectionTransport>> = vec![
+            Box::new(MemoryTransport {
+                name: "alpha",
+                fail: true,
+            }),
+            Box::new(MemoryTransport {
+                name: "beta",
+                fail: true,
+            }),
+        ];
+        let err = io::Error::from(
+            race_boxed("api.example.com", &transports, RaceOptions::default())
+                .await
+                .map(|_| ())
+                .expect_err("both failed"),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
     }
 
     /// A transport that routes by a name the caller does not know must be able to say so, and the
