@@ -47,9 +47,9 @@ use flint_dns::{TYPE_A, TYPE_AAAA};
 
 // Re-exported because they are unavoidable in this crate's own API: a caller cannot build a [`Space`]
 // without [`Resolver`] and [`WirePlan`], cannot read a [`Strategy`] without [`DialPolicy`], and cannot
-// name what [`dial`] returns without [`BoxedTlsStream`]. Requiring a direct `flint-dns`/`flint-dial`
+// name what [`dial`] returns without [`AlpnStream`]. Requiring a direct `flint-dns`/`flint-dial`
 // dependency just to spell this crate's types would be a papercut.
-pub use flint_dial::{BoxedTlsStream, WirePlan};
+pub use flint_dial::{AlpnStream, BoxedTlsStream, WirePlan};
 pub use flint_dns::{DialPolicy, Resolver};
 
 pub mod cache;
@@ -410,7 +410,7 @@ pub async fn connect_cached(
     port: u16,
     cache: &StrategyCache,
     network: &str,
-) -> Result<(Strategy, BoxedTlsStream), FindError> {
+) -> Result<(Strategy, AlpnStream), FindError> {
     if space.is_empty() {
         return Err(FindError::EmptySpace {
             resolvers: space.resolvers.len(),
@@ -479,7 +479,13 @@ pub async fn probe(strategy: &Strategy, domain: &str) -> io::Result<()> {
 /// Resolves through the strategy's resolver and connects with its shaping, verifying the destination
 /// certificate against `host`. Returns the established TLS stream for the caller to speak its own
 /// protocol over (an HTTP/2 config fetch, say).
-pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<BoxedTlsStream> {
+///
+/// The returned [`AlpnStream`] carries **the protocol the server actually negotiated**. The shaping
+/// engine offers `h2,http/1.1` because ALPN is part of the fingerprint this crate exists to imitate,
+/// so the peer's choice is not knowable in advance — a consumer that assumes h2 because "a modern
+/// origin picks h2" is guessing, and guesses wrong against an edge that answers http/1.1. Read
+/// [`AlpnStream::alpn`] instead.
+pub async fn dial(strategy: &Strategy, host: &str, port: u16) -> io::Result<AlpnStream> {
     let deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
     let addrs: Vec<SocketAddr> = before(deadline, resolve_all(strategy, host))
         .await?
@@ -508,12 +514,14 @@ async fn dial_first(
     host: &str,
     policy: &DialPolicy,
     deadline: tokio::time::Instant,
-) -> io::Result<BoxedTlsStream> {
+) -> io::Result<AlpnStream> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let slice = remaining / u32::try_from(addrs.len().max(1)).unwrap_or(1);
     let mut last = None;
     for &addr in addrs {
-        match tokio::time::timeout(slice, flint_dial::dial(&verified(addr, host, policy))).await {
+        match tokio::time::timeout(slice, flint_dial::dial_alpn(&verified(addr, host, policy)))
+            .await
+        {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last = Some(e),
             Err(_) => {

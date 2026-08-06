@@ -140,13 +140,40 @@ impl ProxylessTransport {
 
 #[async_trait]
 impl ConnectionTransport for ProxylessTransport {
-    type Stream = flint_proxyless::BoxedTlsStream;
+    type Stream = flint_proxyless::AlpnStream;
 
     fn name(&self) -> &str {
         "proxyless"
     }
 
     async fn connect(&self, host: &str) -> io::Result<Self::Stream> {
+        self.dial(host).await
+    }
+
+    /// Reports the protocol the destination actually chose.
+    ///
+    /// Worth overriding here specifically: this transport's shaping engine offers `h2,http/1.1`
+    /// because ALPN is part of the fingerprint it exists to imitate, so what the peer picks is a
+    /// property of the peer, not of this transport. A consumer that hardcodes h2 because "a modern
+    /// origin picks h2" is right until it meets an edge that answers http/1.1 — and that failure does
+    /// not look like a protocol mismatch, it looks like a response that never terminates.
+    ///
+    /// The `Vec` is allocated here rather than in [`dial`](Self::dial) so
+    /// [`connect`](ConnectionTransport::connect), which would only discard it, does not pay for it.
+    async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
+        let stream = self.dial(host).await?;
+        let alpn = stream.alpn().map(<[u8]>::to_vec);
+        Ok((stream, alpn))
+    }
+}
+
+impl ProxylessTransport {
+    /// Shared body of [`connect`](ConnectionTransport::connect) and
+    /// [`connect_alpn`](ConnectionTransport::connect_alpn): search, or reuse a cached winner.
+    ///
+    /// The returned stream still carries its negotiated ALPN — reading it is the caller's choice, so
+    /// the non-reporting path costs nothing.
+    async fn dial(&self, host: &str) -> io::Result<flint_proxyless::AlpnStream> {
         let space = self.search_space();
         let (_strategy, stream) =
             flint_proxyless::connect_cached(&space, host, self.port, &self.cache, &self.network)
