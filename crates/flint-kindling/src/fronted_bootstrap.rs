@@ -145,6 +145,21 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
         F: Fn(Vec<MaterializedFront>) -> Fut,
         Fut: std::future::Future<Output = io::Result<(MaterializedFront, HttpResponse)>>,
     {
+        self.attempt_with(dial).await
+    }
+
+    /// The cached-front-then-rescan orchestration, over whatever a successful attempt produces.
+    ///
+    /// Generic in the output because two callers need the same front handling for different results:
+    /// [`request`](Self::request) yields an [`HttpResponse`], while
+    /// [`connect_info`](flint_transport::ConnectionTransport::connect_info) yields a live stream. The
+    /// winner is carried out of the attempt rather than indexed back into the slice, so caching cannot
+    /// alias the wrong front (see `request`).
+    async fn attempt_with<F, Fut, T>(&self, dial: F) -> io::Result<T>
+    where
+        F: Fn(Vec<MaterializedFront>) -> Fut,
+        Fut: std::future::Future<Output = io::Result<(MaterializedFront, T)>>,
+    {
         // 1. Reuse the front that worked last time, if any.
         let cached = self.locked_cache().clone();
         if let Some(front) = cached {
@@ -175,6 +190,91 @@ impl<R: FrontResolver> FrontedBootstrap<R> {
 
     fn locked_cache(&self) -> std::sync::MutexGuard<'_, Option<MaterializedFront>> {
         self.cached.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> flint_transport::ConnectionTransport for FrontedBootstrap<R>
+where
+    R: FrontResolver + Send + Sync,
+{
+    type Stream = flint_fronted::AlpnStream;
+
+    fn name(&self) -> &str {
+        "fronted-scan"
+    }
+
+    async fn connect(&self, host: &str) -> io::Result<Self::Stream> {
+        self.connect_info(host).await.map(|(stream, _)| stream)
+    }
+
+    /// Scan (or reuse a cached winner), then hand the raced connection up with the two facts the
+    /// winning edge decides: its negotiated ALPN, and the authority a request must carry.
+    ///
+    /// **Rejects a `host` other than the one this transport was built for.** It is constructed *for*
+    /// one inner host, and its whole job is finding an edge that re-originates to that host — the
+    /// scan targets and the cached winner are both specific to it. Silently substituting the
+    /// configured host would front somewhere the caller did not ask for and return a *successful*
+    /// response from the wrong origin, which is far worse than an error.
+    ///
+    /// A hard error rather than a `debug_assert!`, which compiles out exactly where the mistake would
+    /// do damage. It is also the only form that can be tested: an assert would panic in a debug test
+    /// run before the error path was reachable.
+    ///
+    /// **One honest difference from [`request`](Self::request).** There, a cached front is evicted
+    /// when the *request* fails, so an edge that connects but does not re-originate gets dropped.
+    /// Here the caller performs the request, so success means only that TLS completed — a
+    /// non-re-originating edge would stay cached and keep losing at the HTTP layer. Callers that can
+    /// tell should call [`forget_cached_front`](Self::forget_cached_front) on a bad response; the
+    /// alternative, evicting on every connect, would throw away the caching this exists for.
+    async fn connect_info(
+        &self,
+        host: &str,
+    ) -> io::Result<(Self::Stream, flint_transport::ConnectionInfo)> {
+        if host != self.fronted_host {
+            // Neither host is named: this error travels wherever its caller logs it, and both values
+            // are destinations. The caller holds both and can compare them itself.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fronted-scan is built for a single inner host and was asked for a different one",
+            ));
+        }
+        let options = self.options.clone();
+        let inner = self.fronted_host.clone();
+        self.attempt_with(move |fronts| {
+            let options = options.clone();
+            let inner = inner.clone();
+            async move {
+                let conn = dial_fronts_alpn(&inner, &fronts, options)
+                    .await
+                    .map_err(io::Error::other)?;
+                // Cache the winner taken straight from the connection — never indexed back into
+                // `fronts`, which would alias the wrong front when one carries several addrs.
+                let win = MaterializedFront {
+                    front: conn.front.clone(),
+                    addrs: vec![conn.addr],
+                };
+                let info = flint_transport::ConnectionInfo {
+                    alpn: conn.stream.alpn().map(<[u8]>::to_vec),
+                    // Per-provider: Akamai, CloudFront and Aliyun each route by a different inner
+                    // host, so the caller cannot know this before the race resolves.
+                    authority: Some(conn.fronted_host().to_owned()),
+                };
+                Ok((win, (conn.stream, info)))
+            }
+        })
+        .await
+    }
+}
+
+impl<R: FrontResolver> FrontedBootstrap<R> {
+    /// Drop the cached winning front so the next attempt rescans.
+    ///
+    /// For the connection path: a caller that discovers the edge connected but did not front
+    /// correctly (a wrong-looking HTTP response) can say so, restoring the eviction that
+    /// [`request`](Self::request) gets for free by owning the request itself.
+    pub fn forget_cached_front(&self) {
+        *self.locked_cache() = None;
     }
 }
 
@@ -239,6 +339,93 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// A mismatched host must be refused in **every** build, not just debug.
+    ///
+    /// This is the case a `debug_assert!` would compile out precisely where it matters: in release,
+    /// the transport would have fronted for its configured host instead and returned a successful
+    /// response from an origin the caller never asked for. Testable only because it is a real error —
+    /// an assert would panic here rather than return.
+    #[tokio::test]
+    async fn connecting_for_a_different_host_is_refused() {
+        use flint_transport::ConnectionTransport as _;
+
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver());
+        // `AlpnStream` is not `Debug`, so unwrap the Result by hand rather than via `expect_err`.
+        let err = match b.connect_info("somewhere.else.test").await {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse a host it was not built for"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Log hygiene: the message names the defect, never either destination.
+        let msg = err.to_string();
+        assert!(!msg.contains("meek.test"), "message leaked a host: {msg}");
+        assert!(
+            !msg.contains("somewhere.else.test"),
+            "message leaked a host: {msg}"
+        );
+    }
+
+    /// `attempt_with` is what the connection path reuses, so pin that it is genuinely the same
+    /// orchestration: cached front tried alone, evicted on failure, full set raced, winner re-cached.
+    /// If `connect_info` ever grew its own copy of this logic, the scanner would quietly stop caching
+    /// on the connection path and rescan on every fetch.
+    #[tokio::test]
+    async fn the_connection_path_shares_the_cache_orchestration() {
+        // Same three-provider setup as the sibling cache tests, so "raced the full set" is
+        // distinguishable from "reused one cached front".
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver()).with_targets(
+            ScanTargets::for_host("meek.test")
+                .with_cloudfront_host("meek.cf.test")
+                .with_aliyun_host("meek.aliyun.test"),
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        // A dial that yields a stream-shaped value rather than an HttpResponse, exactly as
+        // `connect_info` does — the point is that `attempt_with` does not care which.
+        let dial = {
+            let calls = calls.clone();
+            move |fronts: Vec<MaterializedFront>| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.lock().unwrap().push(fronts.len());
+                    let win = fronts[0].clone();
+                    let authority = win.front.fronted_host.clone();
+                    Ok((win, authority))
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = io::Result<(MaterializedFront, String)>,
+                                > + Send,
+                        >,
+                    >
+            }
+        };
+
+        // First attempt scans and caches; second reuses the single cached front.
+        let first = b.attempt_with(&dial).await.expect("first attempt");
+        let second = b.attempt_with(&dial).await.expect("second attempt");
+        assert_eq!(first, second, "same winning front both times");
+        let seen = calls.lock().unwrap().clone();
+        assert!(
+            seen[0] > 1,
+            "first attempt races the scanned set, got {seen:?}"
+        );
+        assert_eq!(
+            seen[1], 1,
+            "second attempt reuses the cached front, got {seen:?}"
+        );
+
+        // And the escape hatch the connection path needs, since it cannot see the HTTP outcome.
+        b.forget_cached_front();
+        b.attempt_with(&dial).await.expect("third attempt");
+        let seen = calls.lock().unwrap().clone();
+        assert!(
+            seen[2] > 1,
+            "forget_cached_front must force a rescan, got {seen:?}"
+        );
     }
 
     #[tokio::test]

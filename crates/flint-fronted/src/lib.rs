@@ -29,8 +29,8 @@ use flint_dial::{BootstrapStrategy, BoxedTlsStream, CertVerification};
 use flint_dns::{ResolverCache, TYPE_A, TYPE_AAAA};
 use flint_shaping::WirePlan;
 pub use flint_transport::{
-    race_boxed, BoxedConnection, BoxedConnectionTransport, Connection, ConnectionTransport,
-    RaceError, RaceOptions, TransportConnection,
+    race_boxed, BoxedConnection, BoxedConnectionTransport, Connection, ConnectionInfo,
+    ConnectionTransport, RaceError, RaceOptions, TransportConnection,
 };
 
 pub mod meek_poll;
@@ -41,6 +41,12 @@ pub use meek_poll::{
 
 pub mod sys_dns;
 pub use sys_dns::SystemResolver;
+
+// Re-exported because it is unavoidable in this crate's own API: `dial_fronts_alpn` and
+// `FrontedTlsDialer`'s `ConnectionTransport::Stream` both surface it, and a caller cannot name what
+// they return without it. Taking a direct `flint-dial` dependency just to spell this crate's types
+// would be a papercut (same reasoning as flint-proxyless's re-exports).
+pub use flint_dial::AlpnStream;
 
 pub mod scanner;
 pub use scanner::{Candidate, ScanResult, ScanTargets};
@@ -458,15 +464,27 @@ where
     /// Race the fronts and keep the winning edge's negotiated ALPN attached.
     ///
     /// Shared by [`connect`](ConnectionTransport::connect) and
-    /// [`connect_alpn`](ConnectionTransport::connect_alpn) so both take one path; the only cost to a
+    /// [`connect_info`](ConnectionTransport::connect_info) so both take one path; the only cost to a
     /// caller that ignores the ALPN is [`AlpnStream`](flint_dial::AlpnStream)'s thin forwarding
     /// wrapper, which is cheaper than two dial paths that could drift apart.
     async fn dial_keeping_alpn(&self, host: &str) -> io::Result<flint_dial::AlpnStream> {
+        self.dial_keeping_alpn_and_front(host).await.map(|(s, _)| s)
+    }
+
+    /// As [`dial_keeping_alpn`](Self::dial_keeping_alpn), but also returns the winning front's inner
+    /// host — the authority a request over this connection must be addressed to.
+    async fn dial_keeping_alpn_and_front(
+        &self,
+        host: &str,
+    ) -> io::Result<(flint_dial::AlpnStream, String)> {
         self.connect_fronted_with(host, |strategy| async move {
             flint_dial::dial_alpn(&strategy).await
         })
         .await
-        .map(|conn| conn.stream)
+        .map(|conn| {
+            let authority = conn.fronted_host().to_owned();
+            (conn.stream, authority)
+        })
         .map_err(io::Error::other)
     }
 }
@@ -486,18 +504,29 @@ where
         self.dial_keeping_alpn(host).await
     }
 
-    /// Reports what the winning **edge** negotiated.
+    /// Reports both facts the winning **edge** determines: the ALPN it negotiated, and the authority
+    /// a request over this connection must carry.
     ///
-    /// This transport needs the override more than most. A CDN front is not one server, and measured
-    /// against a live edge the answer varied *per connection* — h2 on one dial, http/1.1 on the next,
-    /// from the same front list. The protocol is therefore not a property of the front, of the pool,
-    /// or of this dialer; it belongs to whichever POP happened to answer. A consumer that picks an
-    /// HTTP version once and reuses it is right most of the time and hangs the rest, because writing
-    /// the wrong version does not fail like a protocol error — the response never terminates.
-    async fn connect_alpn(&self, host: &str) -> io::Result<(Self::Stream, Option<Vec<u8>>)> {
-        let stream = self.dial_keeping_alpn(host).await?;
-        let alpn = stream.alpn().map(<[u8]>::to_vec);
-        Ok((stream, alpn))
+    /// Neither is knowable before the race. A CDN front is not one server — measured against a live
+    /// edge the protocol varied *per connection*, h2 on one dial and http/1.1 on the next from the
+    /// same front list — so the protocol belongs to whichever POP answered, not to the front, the
+    /// pool, or this dialer. A consumer that picks a version once is right most of the time and hangs
+    /// the rest, because writing the wrong one does not fail like a protocol error; the response
+    /// simply never terminates.
+    ///
+    /// The **authority** is the subtler of the two, and skipping it is the quieter bug. A fronted
+    /// request must name the front's own inner host so the edge re-originates it, and that name
+    /// differs per provider — Akamai, CloudFront and Aliyun each route by a different one. Address
+    /// the host the caller asked for and the connection still succeeds; only the routing is wrong, so
+    /// it reads as that CDN being blocked. This is the same value [`request`](Self::request) passes
+    /// to `h2_oneshot` internally; the override exists so a raced consumer gets it too.
+    async fn connect_info(&self, host: &str) -> io::Result<(Self::Stream, ConnectionInfo)> {
+        let (stream, authority) = self.dial_keeping_alpn_and_front(host).await?;
+        let info = ConnectionInfo {
+            alpn: stream.alpn().map(<[u8]>::to_vec),
+            authority: Some(authority),
+        };
+        Ok((stream, info))
     }
 }
 
@@ -2457,16 +2486,16 @@ providers:
         (addr, task)
     }
 
-    /// Drives the shipping path — [`ConnectionTransport::connect_alpn`] itself — against a real local
+    /// Drives the shipping path — [`ConnectionTransport::connect_info`] itself — against a real local
     /// TLS edge over real TCP, so a regression that stopped reporting ALPN (the bug this PR fixes)
     /// fails here.
     ///
     /// The sibling test below injects its own `dial_one` through `connect_fronted_with`, which proves
-    /// the plumbing but *bypasses* `connect_alpn` and `dial_keeping_alpn` entirely — it would still
+    /// the plumbing but *bypasses* `connect_info` and `dial_keeping_alpn` entirely — it would still
     /// pass if the override were deleted. Hence this one.
     #[cfg(feature = "boring")]
     #[tokio::test]
-    async fn connect_alpn_reports_what_the_edge_negotiated() {
+    async fn connect_info_reports_what_the_edge_negotiated() {
         use flint_transport::ConnectionTransport as _;
 
         for (offered, expected) in [
@@ -2484,15 +2513,20 @@ providers:
                 },
             );
 
-            let (stream, alpn) = dialer
-                .connect_alpn("api.example.com")
+            let (stream, info) = dialer
+                .connect_info("api.example.com")
                 .await
-                .expect("connect_alpn against the local edge");
+                .expect("connect_info against the local edge");
             assert_eq!(
-                alpn.as_deref(),
+                info.alpn.as_deref(),
                 expected,
-                "connect_alpn must report the edge's choice, not a default"
+                "connect_info must report the edge's choice, not a default"
             );
+            // The fronted authority is the front's own inner host, NOT the origin asked for:
+            // `api.example.com` is aliased to `origin.example.net` by this provider. Addressing the
+            // asked-for host would reach the right edge and route wrong, which reads as a block.
+            assert_eq!(info.authority.as_deref(), Some("origin.example.net"));
+            assert_eq!(info.authority("api.example.com"), "origin.example.net");
             // And the same value is readable off the stream, so a caller holding only the stream is
             // not left guessing either.
             assert_eq!(stream.alpn(), expected);
@@ -3241,12 +3275,13 @@ providers:
         let transports: Vec<Box<dyn BoxedConnectionTransport>> = vec![Box::new(MemoryTransport)];
         assert_eq!(transports[0].name(), "memory");
 
-        let (mut conn, alpn) = transports[0]
+        let (mut conn, info) = transports[0]
             .connect_boxed("api.example.com")
             .await
             .unwrap();
-        // This transport does not override `connect_alpn`, so no ALPN is known — reported, not guessed.
-        assert_eq!(alpn, None);
+        // This transport overrides nothing, so it reports an empty `ConnectionInfo` rather than
+        // inventing an ALPN or an authority.
+        assert_eq!(info, ConnectionInfo::default());
         conn.write_all(b"ping").await.unwrap();
         let mut out = [0; 4];
         conn.read_exact(&mut out).await.unwrap();
