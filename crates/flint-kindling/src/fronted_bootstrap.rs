@@ -211,9 +211,15 @@ where
     /// Scan (or reuse a cached winner), then hand the raced connection up with the two facts the
     /// winning edge decides: its negotiated ALPN, and the authority a request must carry.
     ///
-    /// `host` is ignored: this transport is constructed *for* one inner host, and its whole job is
-    /// finding an edge that re-originates to that host. Honouring a different argument would mean
-    /// fronting to somewhere the scan never verified.
+    /// **Rejects a `host` other than the one this transport was built for.** It is constructed *for*
+    /// one inner host, and its whole job is finding an edge that re-originates to that host — the
+    /// scan targets and the cached winner are both specific to it. Silently substituting the
+    /// configured host would front somewhere the caller did not ask for and return a *successful*
+    /// response from the wrong origin, which is far worse than an error.
+    ///
+    /// A hard error rather than a `debug_assert!`, which compiles out exactly where the mistake would
+    /// do damage. It is also the only form that can be tested: an assert would panic in a debug test
+    /// run before the error path was reachable.
     ///
     /// **One honest difference from [`request`](Self::request).** There, a cached front is evicted
     /// when the *request* fails, so an edge that connects but does not re-originate gets dropped.
@@ -225,10 +231,14 @@ where
         &self,
         host: &str,
     ) -> io::Result<(Self::Stream, flint_transport::ConnectionInfo)> {
-        debug_assert!(
-            host == self.fronted_host,
-            "FrontedBootstrap is built for one inner host; the race asked for a different one"
-        );
+        if host != self.fronted_host {
+            // Neither host is named: this error travels wherever its caller logs it, and both values
+            // are destinations. The caller holds both and can compare them itself.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fronted-scan is built for a single inner host and was asked for a different one",
+            ));
+        }
         let options = self.options.clone();
         let inner = self.fronted_host.clone();
         self.attempt_with(move |fronts| {
@@ -329,6 +339,32 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// A mismatched host must be refused in **every** build, not just debug.
+    ///
+    /// This is the case a `debug_assert!` would compile out precisely where it matters: in release,
+    /// the transport would have fronted for its configured host instead and returned a successful
+    /// response from an origin the caller never asked for. Testable only because it is a real error —
+    /// an assert would panic here rather than return.
+    #[tokio::test]
+    async fn connecting_for_a_different_host_is_refused() {
+        use flint_transport::ConnectionTransport as _;
+
+        let b = FrontedBootstrap::with_resolver("meek.test", akamai_resolver());
+        // `AlpnStream` is not `Debug`, so unwrap the Result by hand rather than via `expect_err`.
+        let err = match b.connect_info("somewhere.else.test").await {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse a host it was not built for"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Log hygiene: the message names the defect, never either destination.
+        let msg = err.to_string();
+        assert!(!msg.contains("meek.test"), "message leaked a host: {msg}");
+        assert!(
+            !msg.contains("somewhere.else.test"),
+            "message leaked a host: {msg}"
+        );
     }
 
     /// `attempt_with` is what the connection path reuses, so pin that it is genuinely the same
