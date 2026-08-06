@@ -157,7 +157,15 @@ impl TransportConnection {
 pub enum RaceError {
     #[error("no connection transports configured for `{host}`")]
     Empty { host: String },
+    /// `#[non_exhaustive]` because this variant just grew a field and broke that shape once already.
+    /// Only [`race_boxed`] constructs it, so nothing loses anything, and the next field costs
+    /// downstream nothing rather than a compile error.
+    ///
+    /// Applied to the variant, not the enum: enum-level would force every consumer to add a
+    /// catch-all arm today to guard against a variant nobody has proposed, which is a bigger
+    /// imposition than the problem.
     #[error("all {tried} connection transports failed for `{host}`: {errors}")]
+    #[non_exhaustive]
     AllFailed {
         host: String,
         tried: usize,
