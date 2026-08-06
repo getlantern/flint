@@ -2394,12 +2394,138 @@ providers:
         builder
             .set_certificate(base.context().certificate().unwrap())
             .unwrap();
+        // Cheap, and it turns a key/cert mismatch into a clear error right here instead of an opaque
+        // handshake failure inside whichever test happens to use this acceptor.
+        builder.check_private_key().unwrap();
         // `pick` is a wire-format ALPN list (length-prefixed), so it can be offered to
         // `select_next_proto` as the server's preference set directly.
         builder.set_alpn_select_callback(move |_ssl, client| {
             boring2::ssl::select_next_proto(pick, client).ok_or(boring2::ssl::AlpnError::NOACK)
         });
         builder.build()
+    }
+
+    /// A config whose single front points at `addr`, so a test can drive the **real** dial path
+    /// against a local listener. `parse_endpoint` tries `SocketAddr` first, so an `ip:port`
+    /// masquerade keeps its port rather than defaulting to 443.
+    #[cfg(feature = "boring")]
+    fn config_pointing_at(ca_pem: String, addr: SocketAddr) -> Config {
+        Config {
+            trusted_cas: vec![CA {
+                common_name: "Test Root".into(),
+                cert: ca_pem,
+            }],
+            providers: BTreeMap::from([(
+                "akamai".into(),
+                Provider {
+                    host_aliases: BTreeMap::from([(
+                        "api.example.com".into(),
+                        "origin.example.net".into(),
+                    )]),
+                    fronting_snis: BTreeMap::new(),
+                    masquerades: vec![Masquerade {
+                        domain: "edge.test".into(),
+                        ip_address: addr.to_string(),
+                        sni: String::new(),
+                        verify_hostname: None,
+                    }],
+                    ..Default::default()
+                },
+            )]),
+        }
+    }
+
+    /// Serve TLS on a fresh local port, negotiating `pick`, until the returned guard is dropped.
+    #[cfg(feature = "boring")]
+    async fn tls_edge(
+        ca: &TestCa,
+        pick: &'static [u8],
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = std::sync::Arc::new(server_acceptor_alpn(ca, "edge.test", pick));
+        let task = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = tokio_boring2::accept(&acceptor, sock).await {
+                        let _ = tls.write_all(b"ok").await;
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    /// Drives the shipping path — [`ConnectionTransport::connect_alpn`] itself — against a real local
+    /// TLS edge over real TCP, so a regression that stopped reporting ALPN (the bug this PR fixes)
+    /// fails here.
+    ///
+    /// The sibling test below injects its own `dial_one` through `connect_fronted_with`, which proves
+    /// the plumbing but *bypasses* `connect_alpn` and `dial_keeping_alpn` entirely — it would still
+    /// pass if the override were deleted. Hence this one.
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn connect_alpn_reports_what_the_edge_negotiated() {
+        use flint_transport::ConnectionTransport as _;
+
+        for (offered, expected) in [
+            (&b"\x02h2"[..], Some(&b"h2"[..])),
+            (&b"\x08http/1.1"[..], Some(&b"http/1.1"[..])),
+        ] {
+            let ca = test_ca();
+            let (addr, edge) = tls_edge(&ca, offered).await;
+            let cfg = config_pointing_at(ca.pem.clone(), addr);
+            let dialer = FrontedTlsDialer::new(&cfg, "", StaticResolver(vec![])).with_dial_options(
+                DialOptions {
+                    window: 1,
+                    attempt_timeout: None,
+                    ..Default::default()
+                },
+            );
+
+            let (stream, alpn) = dialer
+                .connect_alpn("api.example.com")
+                .await
+                .expect("connect_alpn against the local edge");
+            assert_eq!(
+                alpn.as_deref(),
+                expected,
+                "connect_alpn must report the edge's choice, not a default"
+            );
+            // And the same value is readable off the stream, so a caller holding only the stream is
+            // not left guessing either.
+            assert_eq!(stream.alpn(), expected);
+            edge.abort();
+        }
+    }
+
+    /// A regression guard for the `None` that started all this: `connect` (no ALPN reporting) must
+    /// still hand back a working stream, and must not have quietly become a different code path.
+    #[cfg(feature = "boring")]
+    #[tokio::test]
+    async fn connect_shares_the_alpn_path_and_still_works() {
+        use flint_transport::ConnectionTransport as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let ca = test_ca();
+        let (addr, edge) = tls_edge(&ca, b"\x02h2").await;
+        let cfg = config_pointing_at(ca.pem.clone(), addr);
+        let dialer = FrontedTlsDialer::new(&cfg, "", StaticResolver(vec![])).with_dial_options(
+            DialOptions {
+                window: 1,
+                attempt_timeout: None,
+                ..Default::default()
+            },
+        );
+
+        let mut stream = dialer.connect("api.example.com").await.expect("connect");
+        // Same underlying dial, so the annotation is present even on the path that ignores it.
+        assert_eq!(stream.alpn(), Some(&b"h2"[..]));
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).await.expect("read");
+        assert_eq!(&out, b"ok");
+        edge.abort();
     }
 
     /// The whole point of the `connect_alpn` override: the protocol belongs to the **edge**, and the
